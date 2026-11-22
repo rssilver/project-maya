@@ -16,6 +16,7 @@
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
 #include "glm_fast_state.hpp"
+#include "glm_ablate.cuh"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -1128,6 +1129,10 @@ bool Glm5Model::fast_setup(std::string& err) {
         const size_t all_b = (size_t) (g.n_expert + gf::kSpares) * stride_sum / 20 * 23;
         // --expert-cache auto: the budget checked once written, before the prompt path sizes its chunk from it
         pool_check(floor_b, stride_max, all_b);
+        (void) glm_ablate::vec((int) g_.n_embd);   // STRATA_GLM_ABLATE: the direction on this device, before the pool is sized
+        if (glm_ablate::on())
+            std::fprintf(stderr, "glm ablate: applied on the one-token decode and the prompt path only - not on "
+                         "batched rows (--parallel above 1) or a drafter's verify windows\n");
         // the batched prompt path: its sizes (it borrows the pool's tail, see below)
         if (!prefill_setup(err)) return false;
         size_t free_b = 0, total_b = 0;
@@ -5929,7 +5934,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     // experts are added after the NEXT layer's mixer instead of before its read - the CPU's work overlaps that layer's
     // attention; that attention misses them (the streams get them before its FFN-side read; the last layer waits)
     static const bool defer_env = getenv("STRATA_GLM_DEFER_CPU") != nullptr && std::atoi(getenv("STRATA_GLM_DEFER_CPU")) != 0;
-    const bool defer = defer_env && !graphs && !hop_in && F->cpu_plan != 0ull && !F->all_resident;
+    const bool defer = defer_env && !glm_ablate::on() && !graphs && !hop_in && F->cpu_plan != 0ull && !F->all_resident;
     if (defer && F->defer_post == nullptr && cudaMalloc(&F->defer_post, 8 * sizeof(float)) != cudaSuccess) {
         err = "glm fast: the deferred post weights did not allocate";
         return false;
@@ -5948,6 +5953,10 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         const auto body = [&]() -> bool {
         // ---- the attention-side read (fused with the previous FFN's write)
         gf::HcArgs h;
+        if (il != l0_) {   // STRATA_GLM_ABLATE per layer: both operands of layer il - 1's FFN write
+            glm_ablate::layer_rows(il - 1, F->ffn, 1, g.n_embd, s);
+            glm_ablate::layer_rows(il - 1, Rc, g.hc, g.n_embd, s);
+        }
         h.block_out = il == l0_ ? nullptr : F->ffn;
         h.R_old = Rc;
         h.R_new = Ro;
@@ -6032,6 +6041,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             if (F->prof_on) F->mark("moe_cpu_wait");
         }
         // ---- the FFN-side read (fused with the mixer's write)
+        glm_ablate::rows(F->mixer, 1, g.n_embd, s);   // STRATA_GLM_ABLATE: the mixer's write
         h.block_out = F->mixer;
         h.R_old = Rc;
         h.R_new = Ro;
@@ -6069,6 +6079,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
                 deferred = true;
             }
         }
+        glm_ablate::rows(F->ffn, 1, g.n_embd, s);   // STRATA_GLM_ABLATE: the FFN's write
         if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
         return true;
         };
@@ -6091,6 +6102,8 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         if (const int fe = glmfast::submit_every(); fe > 0 && (il - l0_) % fe == 0) glmfast::submit_queued(s);
     }
     // the last layer's write half: R (in the OTHER buffer) = post x ffn + comb . R
+    glm_ablate::layer_rows(l1_ - 1, F->ffn, 1, g.n_embd, s);   // STRATA_GLM_ABLATE per layer
+    glm_ablate::layer_rows(l1_ - 1, Rc, g.hc, g.n_embd, s);
     gf::hc_post(F->ffn, Rc, F->post, F->comb, g.n_embd, Ro, s);
     if (F->prof_on) F->mark("hc_post_end");
     // keep the convention "the residual lives at state_" for the hop and the head: copy back
@@ -6129,6 +6142,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
                  g.n_embd);
     if (const float* img = image_row(p)) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
+    glm_ablate::rows(F->emb, 1, g.n_embd, F->cs);   // STRATA_GLM_ABLATE
     gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
     if (!fast_layers(p, false, err)) return false;
     // each later part of a split: the residual crosses over through the previous part's pinned hop buffer, the
@@ -6796,6 +6810,7 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
                  g.n_embd);
     if (const float* img = image_row(p)) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
+    glm_ablate::rows(F->emb, 1, g.n_embd, F->cs);   // STRATA_GLM_ABLATE
     gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
     lap(2);
     if (cancellable) {
