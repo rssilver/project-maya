@@ -1784,7 +1784,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                 }
                 if (rs < 0) return false;
                 const int old = R.key[(size_t) rs];
-                upd(F->rtab_key((size_t) old), 0ull);
+                upd(F->rtab_key((size_t) old), F->rtab_none((int) old));
                 F->ram_of[(size_t) old] = -1;
                 F->left[(size_t) old] = 4;
                 ++F->diag_lend_evict;

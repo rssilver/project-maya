@@ -2767,8 +2767,13 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
     s.base = (uint8_t*) v;
     s.path = path;
     s.data_start = data_start;
+    // STRATA_GLM_BUFFERED_READS=1: the same handle without FILE_FLAG_NO_BUFFERING, so the expert reads go through
+    // Windows' file cache: the experts held neither in VRAM nor in the pinned RAM tier then stay in whatever RAM is
+    // free (not pinned, so Windows' cap on locked memory does not apply) and later reads of them skip the SSD.
+    static const bool buffered = getenv("STRATA_GLM_BUFFERED_READS") && std::atoi(getenv("STRATA_GLM_BUFFERED_READS")) != 0;
     HANDLE hd = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                            FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS, nullptr);
+                            (buffered ? 0 : FILE_FLAG_NO_BUFFERING) | FILE_FLAG_OVERLAPPED | FILE_FLAG_RANDOM_ACCESS,
+                            nullptr);
     s.h_direct = hd == INVALID_HANDLE_VALUE ? nullptr : (void*) hd;
     return true;
 #else
@@ -2810,8 +2815,7 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
 void strata::core::Glm5Model::pack_release_views() {
 #ifdef _WIN32
     const char* km = getenv("STRATA_GLM_KEEP_MAP");
-    if (km != nullptr && std::atoi(km) != 0) return;
-    for (const Shard& s : pack_shards_)
+    if (km != nullptr && std::atoi(km) != 0) return;    for (const Shard& s : pack_shards_)
         if (s.base != nullptr && s.h_direct == nullptr) return;
     for (const Shard& s : pack_shards_)
         if (pack_emb_src_ != nullptr && pack_emb_src_ >= s.base && pack_emb_src_ < s.base + s.size) {

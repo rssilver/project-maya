@@ -3605,20 +3605,30 @@ def stale_tuning(cfg: dict) -> str | None:
 
 
 def busy_gpus(cfg: dict) -> list:
-    """The config's GPUs with more than 1 GiB of VRAM in use (another engine on them): [(index, MiB)]."""
+    """The config's GPUs with more VRAM in use than a desktop alone takes (another engine on them): [(index, MiB)].
+    1 GiB on a GPU without a display; 4 GiB on one that drives a display (Windows' desktop alone holds 1-3 GB
+    there, and any model server holds far more).  MAYA_GPU_BUSY_MIB sets one limit for every GPU."""
     try:
-        txt = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used", "--format=csv,noheader,nounits"],
+        txt = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.used,display_active",
+                              "--format=csv,noheader,nounits"],
                              capture_output=True, text=True, timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
         return []
-    used = {}
+    try:
+        fixed = int(os.environ.get("MAYA_GPU_BUSY_MIB", "0"))
+    except ValueError:
+        fixed = 0
+    used, limit = {}, {}
     for line in txt.splitlines():
-        i, _, m = line.partition(",")
+        parts = [p.strip() for p in line.split(",")]
         try:
-            used[int(i)] = int(float(m))
-        except ValueError:
-            pass
-    return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > 1024]
+            i = int(parts[0])
+            used[i] = int(float(parts[1]))
+        except (ValueError, IndexError):
+            continue
+        display = len(parts) > 2 and parts[2].lower() in ("enabled", "yes", "1")
+        limit[i] = fixed if fixed > 0 else (4096 if display else 1024)
+    return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > limit.get(i, 1024)]
 
 
 def calibrate_config(cfg_path: Path) -> bool:

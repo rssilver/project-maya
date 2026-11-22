@@ -275,6 +275,10 @@ void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq,
 // array (tab at [0, N), rtab at [N, 2N), spares at [2N, 2N + n_layers * kSpares)) so a single update
 // kernel applies the host's between-token edits.
 constexpr int kSpares = 3;
+/// A RAM-tier table entry with this bit set is a CPU-ONLY blob (STRATA_GLM_RAM_OVERFLOW, Windows): plain pageable
+/// memory above the driver's pinning cap that the GPU must never read.  The route sends such an expert to the CPU
+/// lane (its blob: the entry less the bit); it is never fetched over PCIe, promoted or prefetched.
+constexpr unsigned long long kCpuOnly = 1ull;
 /// The per-device routing state (device memory unless noted).
 struct MoeDev {
     unsigned long long* tab = nullptr;         // [3 tables, see above]

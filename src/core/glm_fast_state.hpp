@@ -897,6 +897,14 @@ struct Glm5Model::FastState {
     }
     size_t tab_key(int key) const { return (size_t) key; }
     size_t rtab_key(int key) const { return (size_t) n_keys + (size_t) key; }
+    // STRATA_GLM_RAM_OVERFLOW (Windows): key -> its CPU-only blob in pageable RAM above the pinning cap (0: none), and
+    // the arena that holds them.  A RAM-tier entry the tiers let go of falls back to it (rtab_none), not to "disk"
+    std::vector<unsigned long long> ovf;
+    uint8_t* ovf_arena = nullptr;
+    size_t ovf_bytes = 0;
+    unsigned long long rtab_none(int key) const {
+        return (size_t) key < ovf.size() && ovf[(size_t) key] != 0ull ? (ovf[(size_t) key] | gf::kCpuOnly) : 0ull;
+    }
     size_t spare_key(int il, int j) const { return 2 * (size_t) n_keys + (size_t) il * gf::kSpares + (size_t) j; }
     cudaEvent_t get_event() {
         if (!ev_free.empty()) {

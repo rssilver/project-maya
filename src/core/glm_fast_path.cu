@@ -2016,6 +2016,24 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
     F->lane_pending = false;
     cudaSetDevice(dev_);
     if (!fast_cpu_lane_setup(err)) return false;   // keep the existing CPU pool/calibration for batched prefill
+    // STRATA_GLM_RAM_OVERFLOW's CPU-only blobs need the CPU lane: without it nothing would answer them, so their
+    // entries go back to "on disk" (the reads take them as before) and the arena goes
+    if (F->ovf_arena != nullptr && (F->cpu_ans_h == nullptr || F->md.cpu_seq == nullptr)) {
+        const unsigned long long zero = 0ull;
+        for (size_t key = 0; key < F->ovf.size(); ++key)
+            if (F->ovf[key] != 0ull &&
+                !glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key((int) key), &zero, sizeof(zero), cudaMemcpyHostToDevice),
+                                  "RAM overflow off", err))
+                return false;
+        F->ovf.clear();
+#ifdef _WIN32
+        VirtualFree(F->ovf_arena, 0, MEM_RELEASE);
+#else
+        std::free(F->ovf_arena);
+#endif
+        F->ovf_arena = nullptr;
+        std::fprintf(stderr, "glm fast: CUDA%d RAM overflow: the CPU lane is off - its experts stay on the SSD\n", dev_);
+    }
     if (const char* h = getenv("STRATA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0')
         if (!fast_helper_setup(err)) return false;
     F->svc = std::thread([this] { fast_service(); });
@@ -3915,6 +3933,97 @@ bool Glm5Model::fast_warm(std::string& err) {
                          (double) done_bytes / 1e9, (double) total_bytes / 1e9, s);
         }
     }
+    // STRATA_GLM_RAM_OVERFLOW=1: the experts left past VRAM and the pinned RAM tier (Windows' driver caps what one
+    // process may pin at about half the RAM) go into PLAIN pageable RAM, one arena, as CPU-only blobs: the route sends
+    // them to the CPU lane (gf::kCpuOnly in their RAM-tier entry), which reads RAM directly - no disk read, no pinned
+    // staging, no PCIe copy.  Most-routed first (layer round-robin, as the tiers fill), up to the free RAM less
+    // STRATA_GLM_RAM_OVERFLOW_ROOM_GB (6); GGUF packs only (EXL3's blobs are laid out differently).  Needs the CPU
+    // lane: fast_setup_finish takes them back out when it is off.
+    if (const char* ov = getenv("STRATA_GLM_RAM_OVERFLOW"); ov != nullptr && std::atoi(ov) != 0) {
+        const auto o0 = std::chrono::steady_clock::now();
+        double avail = 0.0;
+#ifdef _WIN32
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms)) avail = (double) ms.ullAvailPhys;
+#else
+        if (const long pages = sysconf(_SC_AVPHYS_PAGES), psz = sysconf(_SC_PAGESIZE); pages > 0 && psz > 0)
+            avail = (double) pages * (double) psz;
+#endif
+        const char* rg = getenv("STRATA_GLM_RAM_OVERFLOW_ROOM_GB");
+        const double room = rg != nullptr ? std::atof(rg) : 6.0;
+        const double budget = avail - room * 1e9;
+        struct Ovf {
+            int il, e;
+            size_t at;
+        };
+        std::vector<Ovf> ov_jobs;
+        size_t bytes = 0, left_out = 0;
+        for (bool progress = true; progress;) {
+            progress = false;
+            for (int il = l0_; il < lt_; ++il) {
+                if (!F->L[(size_t) il].moe || pack_layers_[(size_t) il].x_cb >= 0) continue;
+                if (next[(size_t) il] >= g.n_expert || next[(size_t) il] >= (int) order[(size_t) il].size()) continue;
+                const int e = order[(size_t) il][(size_t) next[(size_t) il]++];
+                progress = true;
+                const size_t blob = (F->L[(size_t) il].blob + 255u) & ~(size_t) 255u;   // (bit 0 stays free)
+                if ((double) (bytes + blob) > budget) {
+                    ++left_out;
+                    continue;
+                }
+                ov_jobs.push_back(Ovf{il, e, bytes});
+                bytes += blob;
+            }
+        }
+        uint8_t* arena = nullptr;
+        if (bytes > 0) {
+#ifdef _WIN32
+            arena = (uint8_t*) VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+            arena = (uint8_t*) std::aligned_alloc(4096, (bytes + 4095) & ~(size_t) 4095);
+#endif
+        }
+        if (bytes > 0 && arena == nullptr) {
+            std::fprintf(stderr, "glm fast: CUDA%d RAM overflow: %.1f GB of pageable RAM did not allocate - those "
+                         "experts stay on the SSD\n", dev_, (double) bytes / 1e9);
+        } else if (arena != nullptr) {
+            std::stable_sort(ov_jobs.begin(), ov_jobs.end(), [&](const Ovf& a, const Ovf& b) {   // file order
+                const auto& na = pack_layers_[(size_t) a.il];
+                const auto& nb = pack_layers_[(size_t) b.il];
+                return std::make_pair(na.gate_shard, na.gate_off + (uint64_t) a.e * F->L[(size_t) a.il].gu_bytes) <
+                       std::make_pair(nb.gate_shard, nb.gate_off + (uint64_t) b.e * F->L[(size_t) b.il].gu_bytes);
+            });
+            const int kBatch = 16;
+            for (size_t b = 0; b < ov_jobs.size(); b += kBatch) {
+                const int nb = (int) std::min<size_t>(kBatch, ov_jobs.size() - b);
+                F->workers->run(nb * 3, [&](int job) {
+                    const Ovf& J = ov_jobs[b + (size_t) (job / 3)];
+                    const int role = job % 3;
+                    const auto& Ly = F->L[(size_t) J.il];
+                    const auto& nl = pack_layers_[(size_t) J.il];
+                    const Shard& sh =
+                        pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
+                    const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) J.e * Ly.gu_bytes
+                                         : role == 1 ? nl.up_off + (uint64_t) J.e * Ly.gu_bytes
+                                                     : nl.down_off + (uint64_t) J.e * Ly.dn_bytes;
+                    const size_t len = role == 2 ? Ly.dn_bytes : Ly.gu_bytes;
+                    read_slice(sh, off, len, arena + J.at + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes));
+                });
+            }
+            F->ovf.assign(N, 0ull);
+            for (const Ovf& J : ov_jobs) {
+                const int key = J.il * g.n_expert + J.e;
+                F->ovf[(size_t) key] = (unsigned long long) (arena + J.at);
+                th[N + (size_t) key] = F->ovf[(size_t) key] | gf::kCpuOnly;
+            }
+            F->ovf_arena = arena;
+            F->ovf_bytes = bytes;
+            const double os = std::chrono::duration<double>(std::chrono::steady_clock::now() - o0).count();
+            std::fprintf(stderr, "glm fast: CUDA%d RAM overflow: %zu experts (%.1f GB) in pageable RAM for the CPU lane "
+                         "in %.0f s; %zu left on the SSD (free RAM %.1f GB less %.0f GB room)\n", dev_, ov_jobs.size(),
+                         (double) bytes / 1e9, os, left_out, avail / 1e9, room);
+        }
+    }
     if (const cudaError_t ue = upload_staged(F->stage.empty() ? nullptr : F->stage[0], F->stage_bytes, F->tab, th.data(),
                                              th.size() * sizeof(unsigned long long));
         ue != cudaSuccess) {
@@ -3939,6 +4048,15 @@ void Glm5Model::fast_destroy() {
     {
         std::lock_guard<std::mutex> lk(F->ah_mu);
         F->ah_quit = true;
+    }
+    if (F->ovf_arena != nullptr) {   // (STRATA_GLM_RAM_OVERFLOW; the CPU lane's answers ended with the service)
+#ifdef _WIN32
+        VirtualFree(F->ovf_arena, 0, MEM_RELEASE);
+#else
+        std::free(F->ovf_arena);
+#endif
+        F->ovf_arena = nullptr;
+        F->ovf.clear();
     }
     F->ah_cv.notify_all();
     for (auto& t : F->ah_th) t.join();
@@ -4937,7 +5055,7 @@ void Glm5Model::fast_ahead_route(int il, const int* ids, unsigned int miss, cons
             const int e = ahead[d][i];
             if (e < 0) continue;
             const int key = la * g.n_expert + e;
-            if (F->slot_of[(size_t) key] >= 0 || F->ram_of[(size_t) key] >= 0) continue;
+            if (F->slot_of[(size_t) key] >= 0 || F->ram_of[(size_t) key] >= 0 || F->rtab_none(key) != 0ull) continue;
             if (F->ah_inflight.load(std::memory_order_relaxed) >= kMaxInflight) {
                 ++F->ah_full;
                 continue;
@@ -5097,7 +5215,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
             } else if (R.st[(size_t) s] == FastState::kRRelease) {
                 const int key = R.key[(size_t) s];
                 if (key >= 0) {
-                    upd(F->rtab_key(key), 0ull);
+                    upd(F->rtab_key(key), F->rtab_none(key));
                     if (F->ram_of[(size_t) key] == s) F->ram_of[(size_t) key] = -1;
                 }
                 R.key[(size_t) s] = -1;
@@ -5120,7 +5238,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                     continue;
                 }
                 if (key >= 0 && (ro == s || ro < 0)) {
-                    upd(F->rtab_key(key), 0ull);
+                    upd(F->rtab_key(key), F->rtab_none(key));
                     if (ro == s) F->ram_of[(size_t) key] = -1;
                 }
                 R.key[(size_t) s] = -1;
@@ -5234,7 +5352,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                     const int old = R.key[(size_t) rs];
                     F->left[(size_t) old] = 2;
                     ++F->diag_ram_evict;
-                    upd(F->rtab_key(old), 0ull);
+                    upd(F->rtab_key(old), F->rtab_none(old));
                     F->ram_of[(size_t) old] = -1;
                 }
                 R.key[(size_t) rs] = vkey;
@@ -5272,7 +5390,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         while (nfree < keep_free) {
             const int best = ram_victim(R);
             if (best < 0) break;
-            upd(F->rtab_key(R.key[(size_t) best]), 0ull);
+            upd(F->rtab_key(R.key[(size_t) best]), F->rtab_none(R.key[(size_t) best]));
             F->ram_of[(size_t) R.key[(size_t) best]] = -1;
             F->left[(size_t) R.key[(size_t) best]] = 2;
             ++F->diag_ram_evict;
@@ -5314,7 +5432,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                     R.key[(size_t) m.rslot] = -1;
                 }
                 if (F->ram_of[(size_t) m.key] == m.rslot) F->ram_of[(size_t) m.key] = -1;
-                upd(F->rtab_key((size_t) m.key), 0ull);
+                upd(F->rtab_key((size_t) m.key), F->rtab_none((int) m.key));
                 ++F->bg_up;
             } else {
                 upd(F->tab_key((size_t) m.key), 0ull);

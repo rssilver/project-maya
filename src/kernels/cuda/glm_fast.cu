@@ -4149,7 +4149,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             const float msw = skipped ? 0.0f : a.miss_skip_w;
             const bool light = msw > 0.0f && (float) ((double) pv * inv_w) < msw;
             const bool ram = tid < a.k && tid < skip_from && !light && s_tab[tid] == 0ull && s_rtab[tid] != 0ull &&
-                             s_ho[tid] == 0;
+                             (s_rtab[tid] & kCpuOnly) == 0ull && s_ho[tid] == 0;
             const unsigned int rm = __ballot_sync(0xffffffffu, ram);
             const int to_cpu = (int) ((a.cpu_plan >> (4 * __popc(rm))) & 15ull);
             const unsigned int c = ram ? s_cnt[tid] : 0u;
@@ -4191,7 +4191,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                 const size_t key = (size_t) a.layer * E + s_ids[i];
                 const unsigned int c = s_cnt[i];
                 if (i < skip_from && !light_miss(i) && s_tab[i] == 0ull && s_rtab[i] != 0ull &&
-                    !(a.fast ? s_ho[i] != 0 : a.d.helper_owned && a.d.helper_owned[key])) {
+                    (s_rtab[i] & kCpuOnly) == 0ull && !(a.fast ? s_ho[i] != 0 : a.d.helper_owned && a.d.helper_owned[key])) {
                     ri[f_ram] = i;
                     rcnt[f_ram++] = c;
                 }
@@ -4219,6 +4219,10 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                 // A helper resident is claimed BEFORE PCIe quotas, promotion or disk skipping.
                 // cpu_src stays zero: the host resolves this key in the helper's own cache.
                 cpu |= 1u << i;
+            } else if (ptr == 0ull && (s_rtab[i] & kCpuOnly) != 0ull) {
+                // a CPU-only blob (pageable RAM above the pinning cap): the host computes it - the GPU cannot read it
+                cpu |= 1u << i;
+                s_cs[i] = s_rtab[i] & ~kCpuOnly;
             } else if (ptr == 0ull) {
                 src = s_rtab[i];
                 if (src != 0ull && ((host_set >> i) & 1u)) {
@@ -4301,7 +4305,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                 if (a.fast ? s_ptab[i] != 0ull || s_pho[i] != 0
                            : a.d.tab[key] != 0ull || (a.d.helper_owned && a.d.helper_owned[key])) continue;
                 const unsigned long long src = a.fast ? s_prtab[i] : rtab[key];
-                if (src == 0ull) continue;
+                if (src == 0ull || (src & kCpuOnly) != 0ull) continue;   // (CPU-only: never over PCIe)
                 unsigned long long* const q1 = a.fast ? s_sp1 : sp1;
                 int navail = 0, first = -1;
                 for (int j = 0; j < kSpares; ++j)
