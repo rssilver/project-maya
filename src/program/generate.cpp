@@ -2265,14 +2265,15 @@ static int glm_pack_generate(const Options& o) {
                 const uint64_t h = sn.hits - st1.hits, m = sn.misses - st1.misses;
                 std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
                             "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f "
-                            "disk_gb=%.1f draft_acc=%llu draft_off=%llu\n",
+                            "disk_gb=%.1f draft_acc=%llu draft_off=%llu ovf_used=%lld ovf_backup=%lld ovf_gb=%.1f ssd_only=%lld\n",
                             n / std::max(1e-9, el), 1000.0 * el / n, (double) h / (double) std::max<uint64_t>(1, h + m),
                             (double) (sn.ram_hits - st1.ram_hits) / n, (double) (sn.disk_reads - st1.disk_reads) / n,
                             (double) (sn.promotions - st1.promotions) / n, (long long) sn.pool_used,
                             (long long) sn.pool_slots, (long long) sn.ram_used, (long long) sn.ram_slots, sn.ram_gb,
-                            sn.pool_gb, std::max(0.0, sn.all_gb - sn.pool_gb - sn.ram_gb),
+                            sn.pool_gb, (sn.ovf_gb > 0 ? sn.ssd_gb : std::max(0.0, sn.all_gb - sn.pool_gb - sn.ram_gb)),
                             (unsigned long long) (model.spec_hits_ - hits0),
-                            (unsigned long long) (model.spec_steps_ - spec0));
+                            (unsigned long long) (model.spec_steps_ - spec0), (long long) sn.ovf_used, (long long) sn.ovf_backup, sn.ovf_gb,
+                            (long long) sn.ssd_only);
             }
             bool eos_hit = false;
             for (const int64_t e : eos)
@@ -2384,6 +2385,11 @@ static int glm_pack_generate(const Options& o) {
                          (double) (st2.cpu_experts - st1.cpu_experts) / n, (st2.cpu_ms - st1.cpu_ms) / n,
                          prompt_ms / (double) std::max<size_t>(1, prompt.size()), (long long) st2.pool_used,
                          (long long) st2.pool_slots, (long long) st2.ram_used, (long long) st2.ram_slots);
+            if (st2.ovf_used + st2.ovf_backup > 0)
+                std::fprintf(stderr, "glm tiers: plain RAM %lld experts + %lld backups (%.1f GB), %lld on the SSD only "
+                             "(%.2f GB) | %llu climbed from plain to pinned RAM since the start\n",
+                             (long long) st2.ovf_used, (long long) st2.ovf_backup, st2.ovf_gb, (long long) st2.ssd_only,
+                             st2.ssd_gb, (unsigned long long) st2.ovf_climbs);
             if (st2.disk_skips > st1.disk_skips)
                 std::fprintf(stderr, "glm skip: %.2f disk-only experts/tok left out (MAYA_GLM_DISK_SKIP_W / _FROM)\n",
                              (double) (st2.disk_skips - st1.disk_skips) / n);
@@ -2630,15 +2636,16 @@ static int glm_pack_generate(const Options& o) {
             const uint64_t h = sn.hits - multi_st1.hits, m = sn.misses - multi_st1.misses;
             std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
                         "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f "
-                        "disk_gb=%.1f draft_acc=%llu draft_off=%llu active=%zu\n",
+                        "disk_gb=%.1f draft_acc=%llu draft_off=%llu active=%zu ovf_used=%lld ovf_backup=%lld ovf_gb=%.1f ssd_only=%lld\n",
                         n / std::max(1e-9, el), 1000.0 * el / n, (double) h / (double) std::max<uint64_t>(1, h + m),
                         (double) (sn.ram_hits - multi_st1.ram_hits) / n,
                         (double) (sn.disk_reads - multi_st1.disk_reads) / n,
                         (double) (sn.promotions - multi_st1.promotions) / n, (long long) sn.pool_used,
                         (long long) sn.pool_slots, (long long) sn.ram_used, (long long) sn.ram_slots, sn.ram_gb,
-                        sn.pool_gb, std::max(0.0, sn.all_gb - sn.pool_gb - sn.ram_gb),
+                        sn.pool_gb, (sn.ovf_gb > 0 ? sn.ssd_gb : std::max(0.0, sn.all_gb - sn.pool_gb - sn.ram_gb)),
                         (unsigned long long) (model.spec_hits_ - multi_hits0 + multi_mtp_acc),
-                        (unsigned long long) (model.spec_steps_ - multi_spec0 + multi_mtp_off), gens.size());
+                        (unsigned long long) (model.spec_steps_ - multi_spec0 + multi_mtp_off), gens.size(),
+                        (long long) sn.ovf_used, (long long) sn.ovf_backup, sn.ovf_gb, (long long) sn.ssd_only);
         }
         for (const int64_t e : eos)
             if (e == tok && stop_on_eos) {

@@ -555,6 +555,69 @@ static cudaError_t upload_staged(uint8_t* stage, size_t stage_bytes, void* dst, 
 
 namespace glmfast {
 
+// ---- plain RAM for STRATA_GLM_RAM_OVERFLOW's blobs (page-aligned, so one can go back on its own)
+double avail_ram() {   // the RAM free for new allocations, bytes
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? (double) ms.ullAvailPhys : 0.0;
+#else
+    const long pages = sysconf(_SC_AVPHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+    return pages > 0 && psz > 0 ? (double) pages * (double) psz : 0.0;
+#endif
+}
+size_t ovf_blob_bytes(size_t blob) { return (blob + 4095u) & ~(size_t) 4095u; }
+uint8_t* ovf_alloc(size_t n) {
+#ifdef _WIN32
+    return (uint8_t*) VirtualAlloc(nullptr, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    return (uint8_t*) std::aligned_alloc(4096, ovf_blob_bytes(n));
+#endif
+}
+// Keeps [p, p + n) in RAM (Windows: VirtualLock, after raising the process's minimum working set by n, which the
+// lock counts against; Linux: mlock, within RLIMIT_MEMLOCK).  False where the OS refused.
+bool ovf_lock(uint8_t* p, size_t n) {
+#ifdef _WIN32
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    SIZE_T lo = 0, hi = 0;
+    DWORD fl = 0;
+    if (!GetProcessWorkingSetSizeEx(GetCurrentProcess(), &lo, &hi, &fl)) return false;
+    const SIZE_T nlo = lo + n + ((SIZE_T) 1 << 20), nhi = std::max(hi, nlo + ((SIZE_T) 512 << 20));
+    if (!SetProcessWorkingSetSizeEx(GetCurrentProcess(), nlo, nhi, QUOTA_LIMITS_HARDWS_MIN_DISABLE |
+                                                                     QUOTA_LIMITS_HARDWS_MAX_DISABLE))
+        return false;
+    if (VirtualLock(p, n)) return true;
+    SetProcessWorkingSetSizeEx(GetCurrentProcess(), lo, hi, fl);
+    return false;
+#else
+    return mlock(p, n) == 0;
+#endif
+}
+// Gives a blob back: unlocked, then freed (own: a blob of its own) or decommitted (a blob inside the start's arena)
+void ovf_free(uint8_t* p, size_t n, bool own, bool locked) {
+#ifdef _WIN32
+    if (locked && VirtualUnlock(p, n)) {
+        static std::mutex mu;
+        std::lock_guard<std::mutex> lk(mu);
+        SIZE_T lo = 0, hi = 0;
+        DWORD fl = 0;
+        if (GetProcessWorkingSetSizeEx(GetCurrentProcess(), &lo, &hi, &fl) && lo > n)
+            SetProcessWorkingSetSizeEx(GetCurrentProcess(), lo - n, hi, fl);
+    }
+    if (own)
+        VirtualFree(p, 0, MEM_RELEASE);
+    else
+        VirtualFree(p, n, MEM_DECOMMIT);
+#else
+    if (locked) munlock(p, n);
+    if (own)
+        std::free(p);
+    else
+        madvise(p, n, MADV_DONTNEED);
+#endif
+}
+
 // [off, off + len) of a shard into dst: O_DIRECT through an aligned per-thread bounce buffer when the shard has a
 // direct fd (no page cache), a buffered pread otherwise, the mapping as the last resort
 void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* dst) {
@@ -2043,22 +2106,21 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
     // entries go back to "on disk" (the reads take them as before) and the arena goes
     if (F->ovf_arena != nullptr && (F->cpu_ans_h == nullptr || F->md.cpu_seq == nullptr)) {
         const unsigned long long zero = 0ull;
-        for (size_t key = 0; key < F->ovf.size(); ++key)
-            if (F->ovf[key] != 0ull &&
+        for (size_t key = 0; key < F->ovf.size(); ++key)   // (a backup's expert keeps its tier's entry)
+            if (F->ovf[key] != 0ull && F->slot_of[key] < 0 && F->ram_of[key] < 0 &&
                 !glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key((int) key), &zero, sizeof(zero), cudaMemcpyHostToDevice),
                                   "RAM overflow off", err))
                 return false;
-        F->ovf.clear();
-#ifdef _WIN32
-        VirtualFree(F->ovf_arena, 0, MEM_RELEASE);
-#else
-        std::free(F->ovf_arena);
-#endif
-        F->ovf_arena = nullptr;
+        fast_ovf_release_all();
         std::fprintf(stderr, "glm fast: CUDA%d RAM overflow: the CPU lane is off - its experts stay on the SSD\n", dev_);
     }
     if (const char* h = getenv("STRATA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0')
         if (!fast_helper_setup(err)) return false;
+    // the RAM watcher (STRATA_GLM_RAM_WATCH_S, 10 s; 0: off): only with the overflow's blobs, which need the CPU lane
+    if (F->ovf_arena != nullptr) {
+        const char* w = getenv("STRATA_GLM_RAM_WATCH_S");
+        if (w == nullptr || std::atof(w) > 0.0) F->ovf_watch = std::thread([this] { fast_ovf_watch(); });
+    }
     F->svc = std::thread([this] { fast_service(); });
     glmfast::pin_thread(F->svc.native_handle(), F->cpu_pin);   // (the CPU lane's last worker: on its pool's node)
     return true;
@@ -3975,13 +4037,16 @@ bool Glm5Model::fast_warm(std::string& err) {
 #endif
         const char* rg = getenv("STRATA_GLM_RAM_OVERFLOW_ROOM_GB");
         const double room = rg != nullptr ? std::atof(rg) : 6.0;
+        F->ovf_room = room * 1e9;
         const double budget = avail - room * 1e9;
         struct Ovf {
             int il, e;
             size_t at;
+            bool backup;   // a copy of an expert VRAM or the pinned tier holds (STRATA_GLM_RAM_BACKUP)
         };
         std::vector<Ovf> ov_jobs;
-        size_t bytes = 0, left_out = 0;
+        size_t bytes = 0, left_out = 0, n_backup = 0;
+        const std::vector<int> held = next;   // per layer: how many of its experts (profile order) VRAM or pinned RAM hold
         for (bool progress = true; progress;) {
             progress = false;
             for (int il = l0_; il < lt_; ++il) {
@@ -3989,13 +4054,43 @@ bool Glm5Model::fast_warm(std::string& err) {
                 if (next[(size_t) il] >= g.n_expert || next[(size_t) il] >= (int) order[(size_t) il].size()) continue;
                 const int e = order[(size_t) il][(size_t) next[(size_t) il]++];
                 progress = true;
-                const size_t blob = (F->L[(size_t) il].blob + 255u) & ~(size_t) 255u;   // (bit 0 stays free)
+                const size_t blob = glmfast::ovf_blob_bytes(F->L[(size_t) il].blob);   // (pages: one can go alone)
                 if ((double) (bytes + blob) > budget) {
                     ++left_out;
                     continue;
                 }
-                ov_jobs.push_back(Ovf{il, e, bytes});
+                ov_jobs.push_back(Ovf{il, e, bytes, false});
                 bytes += blob;
+            }
+        }
+        // the backups: with the RAM still free, the held experts too - each layer's coldest first (the end of its
+        // profile order: the experts the tiers let go of first), layer round-robin, until the budget is spent
+        static const bool backup_on = [] {
+            const char* v = getenv("STRATA_GLM_RAM_BACKUP");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        // (STRATA_GLM_RAM_BACKUP_AT_LOAD=1: read here, before the model is ready - ~25 s more for GLM-5.3's ~3,700 on a
+        // 128 GB PC.  By default the RAM watcher reads them in the background from its first round on instead)
+        static const bool backup_at_load = [] {
+            const char* v = getenv("STRATA_GLM_RAM_BACKUP_AT_LOAD");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        F->ovf_fill = backup_on && left_out == 0 && !backup_at_load;
+        if (backup_on && left_out == 0 && backup_at_load) {
+            std::vector<int> back = held;
+            for (bool progress = true; progress;) {
+                progress = false;
+                for (int il = l0_; il < lt_; ++il) {
+                    if (!F->L[(size_t) il].moe || pack_layers_[(size_t) il].x_cb >= 0) continue;
+                    if (back[(size_t) il] <= 0) continue;
+                    const size_t blob = glmfast::ovf_blob_bytes(F->L[(size_t) il].blob);
+                    if ((double) (bytes + blob) > budget) continue;
+                    const int e = order[(size_t) il][(size_t) --back[(size_t) il]];
+                    progress = true;
+                    ov_jobs.push_back(Ovf{il, e, bytes, true});
+                    bytes += blob;
+                    ++n_backup;
+                }
             }
         }
         uint8_t* arena = nullptr;
@@ -4034,17 +4129,30 @@ bool Glm5Model::fast_warm(std::string& err) {
                 });
             }
             F->ovf.assign(N, 0ull);
+            F->ovf_own.assign(N, 0);
             for (const Ovf& J : ov_jobs) {
                 const int key = J.il * g.n_expert + J.e;
                 F->ovf[(size_t) key] = (unsigned long long) (arena + J.at);
-                th[N + (size_t) key] = F->ovf[(size_t) key] | gf::kCpuOnly;
+                F->ovf_own[(size_t) key] = 1;
+                // (a backup's expert has its tier's entry; the copy waits in F->ovf until that tier lets it go)
+                if (!J.backup) th[N + (size_t) key] = F->ovf[(size_t) key] | gf::kCpuOnly;
             }
             F->ovf_arena = arena;
             F->ovf_bytes = bytes;
+            // locked: Windows (or Linux) cannot page them out to the SSD when other programs want RAM - the watcher
+            // gives backups back instead (STRATA_GLM_RAM_LOCK=0: pageable, as before)
+            static const bool lock_on = [] {
+                const char* v = getenv("STRATA_GLM_RAM_LOCK");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            F->ovf_locked = lock_on && glmfast::ovf_lock(arena, bytes);
+            F->ovf_guard = n_backup > 0;
             const double os = std::chrono::duration<double>(std::chrono::steady_clock::now() - o0).count();
-            std::fprintf(stderr, "glm fast: CUDA%d RAM overflow: %zu experts (%.1f GB) in pageable RAM for the CPU lane "
-                         "in %.0f s; %zu left on the SSD (free RAM %.1f GB less %.0f GB room)\n", dev_, ov_jobs.size(),
-                         (double) bytes / 1e9, os, left_out, avail / 1e9, room);
+            std::fprintf(stderr, "glm fast: CUDA%d RAM overflow: %zu experts (%.1f GB) in %s RAM for the CPU lane "
+                         "in %.0f s, %zu of them backup copies of experts VRAM or pinned RAM hold; %zu left on the SSD "
+                         "(free RAM %.1f GB less %.0f GB room)\n", dev_, ov_jobs.size(), (double) bytes / 1e9,
+                         F->ovf_locked ? "locked" : lock_on ? "pageable (the lock was refused)" : "pageable", os,
+                         n_backup, left_out, avail / 1e9, room);
         }
     }
     if (const cudaError_t ue = upload_staged(F->stage.empty() ? nullptr : F->stage[0], F->stage_bytes, F->tab, th.data(),
@@ -4057,6 +4165,256 @@ bool Glm5Model::fast_warm(std::string& err) {
     std::fprintf(stderr, "glm fast: CUDA%d tiers warm: %zu experts (%.1f GB) in %.0f s (%.2f GB/s)\n", dev_, jobs.size(),
                  (double) total_bytes / 1e9, s, (double) total_bytes / 1e9 / std::max(1e-9, s));
     return true;
+}
+
+// ---------------------------------------------------------------- STRATA_GLM_RAM_OVERFLOW's blobs over time
+void Glm5Model::fast_ovf_release_all() {
+    FastState* F = fast_;
+    if (F == nullptr) return;
+    {
+        std::lock_guard<std::mutex> lk(F->ovf_wmu);
+        F->ovf_wquit = true;
+    }
+    F->ovf_wcv.notify_all();
+    if (F->ovf_watch.joinable()) F->ovf_watch.join();
+    F->ovf_guard = false;
+    const int NE = g_.n_expert;
+    std::vector<unsigned long long> own;   // (the watcher's blobs, pending ones too; the arena goes as one)
+    for (size_t key = 0; key < F->ovf.size() && key < F->ovf_own.size(); ++key)
+        if (F->ovf[key] != 0ull && F->ovf_own[key] == 2) own.push_back(((unsigned long long) key << 1));
+    for (unsigned long long k : own) {
+        const size_t key = (size_t) (k >> 1);
+        glmfast::ovf_free((uint8_t*) F->ovf[key], glmfast::ovf_blob_bytes(F->L[key / (size_t) NE].blob), true,
+                          F->ovf_locked);
+    }
+    for (const auto& a : F->ovf_pending)
+        glmfast::ovf_free((uint8_t*) a.p, glmfast::ovf_blob_bytes(F->L[(size_t) a.key / (size_t) NE].blob), true,
+                          F->ovf_locked);
+    F->ovf_pending.clear();
+    if (F->ovf_arena != nullptr) {
+#ifdef _WIN32
+        VirtualFree(F->ovf_arena, 0, MEM_RELEASE);   // (the lock goes with the pages)
+#else
+        std::free(F->ovf_arena);
+#endif
+        F->ovf_arena = nullptr;
+    }
+    F->ovf.clear();
+    F->ovf_own.clear();
+    F->ovf_bytes = 0;
+}
+
+// One expert's blob (gate, up, down - the RAM tier's layout) read from the pack into plain RAM of its own; nullptr when
+// the RAM did not allocate or the layer is not a GGUF one
+uint8_t* Glm5Model::fast_ovf_read(int key) {
+    FastState* F = fast_;
+    const int NE = g_.n_expert, il = key / NE, e = key % NE;
+    const auto& Ly = F->L[(size_t) il];
+    const auto& nl = pack_layers_[(size_t) il];
+    if (!Ly.moe || nl.x_cb >= 0) return nullptr;
+    uint8_t* p = glmfast::ovf_alloc(glmfast::ovf_blob_bytes(Ly.blob));
+    if (p == nullptr) return nullptr;
+    for (int role = 0; role < 3; ++role) {
+        const Shard& sh = pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
+        const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) e * Ly.gu_bytes
+                             : role == 1 ? nl.up_off + (uint64_t) e * Ly.gu_bytes
+                                         : nl.down_off + (uint64_t) e * Ly.dn_bytes;
+        glmfast::read_slice(sh, off, role == 2 ? Ly.dn_bytes : Ly.gu_bytes,
+                            p + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes));
+    }
+    return p;
+}
+
+// The RAM watcher: every STRATA_GLM_RAM_WATCH_S (10) seconds it reads the free RAM.
+//  - Under half the room (STRATA_GLM_RAM_OVERFLOW_ROOM_GB, 6): other programs want RAM.  Backups whose expert the
+//    pinned tier holds go back, the hottest first (the tiers keep those longest), until the room is there again - their
+//    loss costs nothing until such an expert leaves the pinned tier, and it then falls back to the SSD as it did
+//    without a backup.  An expert whose only copy is its blob keeps it (it would otherwise be read from the SSD).
+//  - Over the room plus 2 GB: RAM freed up.  More blobs, read from the pack: first the experts no tier holds (the SSD
+//    only, hottest first: published at the next boundary), then backups of the held ones without one, coldest first.
+void Glm5Model::fast_ovf_watch() {
+    FastState* F = fast_;
+    const int NE = g_.n_expert;
+    const size_t N = F->ovf.size();
+    const char* w = getenv("STRATA_GLM_RAM_WATCH_S");
+    const double every = w != nullptr ? std::atof(w) : 10.0;
+    const int per_round = 256;   // blobs read a round at most (~1.8 GB on GLM-5.3: the reads stay a background job)
+    bool warned = false;
+    const auto blob_of = [&](size_t key) { return glmfast::ovf_blob_bytes(F->L[key / (size_t) NE].blob); };
+    const auto usable = [&](size_t key) {
+        const size_t il = key / (size_t) NE;
+        return il >= (size_t) l0_ && il < (size_t) lt_ && F->L[il].moe && pack_layers_[il].x_cb < 0;
+    };
+    // backups of pinned-held experts, the hottest first (the tiers keep those longest: the cheapest to give back)
+    const auto givable = [&] {
+        std::vector<std::pair<uint32_t, size_t>> c;
+        for (size_t key = 0; key < N; ++key)
+            if (F->ovf[key] != 0ull && F->ram_of[key] >= 0) c.push_back({F->cnt[key], key});
+        std::sort(c.begin(), c.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        return c;
+    };
+    // gives one back (true), unless the tiers changed meanwhile: its RAM-tier entry must be the pinned slot, so that
+    // nothing points at the blob
+    const auto give_back = [&](size_t key) {
+        unsigned long long p = 0;
+        uint8_t own = 0;
+        {
+            std::lock_guard<std::mutex> lk(F->mu);   // (a boundary edits ram_of and reads ovf under it)
+            const int rs = F->ram_of[key];
+            if (F->ovf[key] == 0ull || rs < 0 ||
+                F->rc[(size_t) F->layer_rc[key / (size_t) NE]].st[(size_t) rs] != FastState::kRHold)
+                return false;
+            p = F->ovf[key];
+            own = F->ovf_own[key];
+            F->ovf[key] = 0ull;
+            F->ovf_own[key] = 0;
+        }
+        glmfast::ovf_free((uint8_t*) p, blob_of(key), own == 2, F->ovf_locked);
+        F->ovf_bytes -= blob_of(key);
+        F->ovf_released.fetch_add(1);
+        return true;
+    };
+    const auto t_fill = std::chrono::steady_clock::now();
+    size_t filled = 0;
+    // the start's backups (F->ovf_fill): read now, back to back, then the guard goes on (fast_boundary's victims)
+    const auto fill_done = [&] {
+        {
+            std::lock_guard<std::mutex> lk(F->mu);
+            F->ovf_fill = false;
+            F->ovf_guard = filled > 0;
+        }
+        std::fprintf(stderr, "glm fast: CUDA%d RAM watcher: %zu backup copies read in %.0f s - an expert the tiers let "
+                     "go of falls back to plain RAM%s\n", dev_, filled,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t_fill).count(),
+                     filled > 0 ? ", never to the SSD" : " where it has a copy");
+    };
+    for (bool first = true;; first = false) {
+        {
+            std::unique_lock<std::mutex> lk(F->ovf_wmu);
+            if (!first && !F->ovf_fill)
+                F->ovf_wcv.wait_for(lk, std::chrono::milliseconds((int64_t) (every * 1000.0)),
+                                    [&] { return F->ovf_wquit; });
+            if (F->ovf_wquit) return;
+        }
+        const double avail = glmfast::avail_ram();
+        if (avail <= 0.0) continue;
+        if (avail < 0.5 * F->ovf_room) {
+            const double need = F->ovf_room - avail;
+            double freed = 0.0;
+            size_t n = 0;
+            for (const auto& [cnt, key] : givable()) {
+                if (freed >= need) break;
+                (void) cnt;
+                if (!give_back(key)) continue;
+                freed += (double) blob_of(key);
+                ++n;
+            }
+            std::fprintf(stderr, "glm fast: CUDA%d RAM watcher: %.1f GB free, under %.0f GB: gave back %zu backup copies "
+                         "(%.1f GB)\n", dev_, avail / 1e9, 0.5 * F->ovf_room / 1e9, n, freed / 1e9);
+            if (freed < need && !warned) {
+                warned = true;
+                std::fprintf(stderr, "glm fast: CUDA%d RAM watcher: RAM stays short - the experts whose only copy is in "
+                             "plain RAM keep it (locked: %s)\n", dev_, F->ovf_locked ? "yes" : "no, Windows may page it");
+            }
+            if (F->ovf_fill) fill_done();
+            continue;
+        }
+        // RAM to spare: more blobs.  The experts on the SSD only come first and may also take a backup's place (a
+        // backup of the hottest pinned-held expert goes, so the RAM the blobs take stays the same); backups of held
+        // experts only from RAM really free (over the room plus 2 GB)
+        const bool grow = avail >= F->ovf_room + 2e9;
+        if (grow) warned = false;
+        if (F->ovf_fill && !grow) {   // (no RAM to spare for the backups at the start: as before, no guard)
+            fill_done();
+            continue;
+        }
+        double budget = std::max(0.0, avail - F->ovf_room - 1e9);   // (a swap is one for one: never below the room)
+        std::vector<std::pair<uint32_t, size_t>> ssd, back;
+        for (size_t key = 0; key < N; ++key) {
+            if (F->ovf[key] != 0ull || !usable(key)) continue;
+            if (F->slot_of[key] < 0 && F->ram_of[key] < 0) ssd.push_back({F->cnt[key], key});
+            else if (grow) back.push_back({F->cnt[key], key});
+        }
+        if (ssd.empty() && back.empty()) {
+            if (F->ovf_fill) fill_done();
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lk(F->mu);
+            for (const auto& a : F->ovf_pending) budget -= (double) blob_of((size_t) a.key);
+        }
+        std::sort(ssd.begin(), ssd.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::sort(back.begin(), back.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        const size_t n_ssd_cand = ssd.size();
+        ssd.insert(ssd.end(), back.begin(), back.end());
+        std::vector<std::pair<uint32_t, size_t>> gives;
+        size_t gi = 0, n_swapped = 0;
+        size_t n = 0, n_ssd = 0;
+        double added = 0.0;
+        for (size_t ci = 0; ci < ssd.size(); ++ci) {
+            const size_t key = ssd[ci].second;
+            if (!F->ovf_fill && n >= (size_t) per_round) break;   // (the start's fill reads them all at once)
+            if ((double) blob_of(key) > budget) {
+                if (ci >= n_ssd_cand) break;   // (a backup needs RAM that is really free)
+                if (gives.empty()) gives = givable();
+                bool made = false;
+                while (!made && gi < gives.size()) {
+                    const size_t g2 = gives[gi++].second;
+                    // (only a backup of a hotter expert than this one: never trade a likelier need for a rarer one)
+                    if (F->cnt[g2] <= F->cnt[key]) {
+                        gi = gives.size();
+                        break;
+                    }
+                    if (give_back(g2)) {
+                        budget += (double) blob_of(g2);
+                        made = (double) blob_of(key) <= budget;
+                        ++n_swapped;
+                    }
+                }
+                if (!made) break;
+            }
+            {
+                std::lock_guard<std::mutex> lk(F->ovf_wmu);
+                if (F->ovf_wquit) return;
+            }
+            uint8_t* p = fast_ovf_read((int) key);
+            if (p == nullptr) break;
+            if (F->ovf_locked) glmfast::ovf_lock(p, blob_of(key));
+            bool kept = true;
+            {
+                std::lock_guard<std::mutex> lk(F->mu);
+                bool pending = false;
+                for (const auto& a : F->ovf_pending) pending |= (size_t) a.key == key;
+                if (F->ovf[key] != 0ull || pending) {
+                    kept = false;
+                } else if (F->slot_of[key] < 0 && F->ram_of[key] < 0) {
+                    F->ovf_pending.push_back({(int) key, (unsigned long long) p});   // (its entry: at the boundary)
+                    ++n_ssd;
+                } else {
+                    F->ovf[key] = (unsigned long long) p;   // a backup: nothing points at it until its tier lets go
+                    F->ovf_own[key] = 2;
+                }
+            }
+            if (!kept) {
+                glmfast::ovf_free(p, blob_of(key), true, F->ovf_locked);
+                continue;
+            }
+            F->ovf_bytes += blob_of(key);
+            budget -= (double) blob_of(key);
+            added += (double) blob_of(key);
+            ++n;
+        }
+        F->ovf_added += n;
+        if (F->ovf_fill) {
+            filled = n;
+            fill_done();
+            continue;
+        }
+        if (n > 0)
+            std::fprintf(stderr, "glm fast: CUDA%d RAM watcher: %.1f GB free: %zu more experts in plain RAM (%.1f GB), "
+                         "%zu of them read back from the SSD (%zu in place of a hot expert's backup)\n", dev_,
+                         avail / 1e9, n, added / 1e9, n_ssd, n_swapped);
+    }
 }
 
 void Glm5Model::fast_destroy() {
@@ -4072,15 +4430,7 @@ void Glm5Model::fast_destroy() {
         std::lock_guard<std::mutex> lk(F->ah_mu);
         F->ah_quit = true;
     }
-    if (F->ovf_arena != nullptr) {   // (STRATA_GLM_RAM_OVERFLOW; the CPU lane's answers ended with the service)
-#ifdef _WIN32
-        VirtualFree(F->ovf_arena, 0, MEM_RELEASE);
-#else
-        std::free(F->ovf_arena);
-#endif
-        F->ovf_arena = nullptr;
-        F->ovf.clear();
-    }
+    fast_ovf_release_all();   // (STRATA_GLM_RAM_OVERFLOW; the CPU lane's answers ended with the service)
     F->ah_cv.notify_all();
     for (auto& t : F->ah_th) t.join();
     F->workers.reset();
@@ -4402,6 +4752,22 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
         for (const auto& R : F->rc) {
             s.ram_slots += R.n;
             for (char c : R.st) s.ram_used += c == FastState::kRHold || c == FastState::kRNew || c == FastState::kRHelper;
+        }
+        s.ovf_gb += (double) F->ovf_bytes / 1073741824.0;
+        s.ovf_climbs += F->ovf_climbs.load();
+        // (racy reads of tables the service thread edits, as the counts above: a count for the Monitor, not a decision)
+        const size_t NL = F->lp.size(), NE = NL > 0 ? F->slot_of.size() / NL : 0;
+        for (size_t il = 0; il < NL && NE > 0; ++il) {
+            if (F->lp[il].n <= 0) continue;   // (not an MoE layer of this part)
+            for (size_t e = 0; e < NE; ++e) {
+                const size_t key = il * NE + e;
+                const bool ovf = key < F->ovf.size() && F->ovf[key] != 0ull;
+                const bool held = F->slot_of[key] >= 0 || (key < F->ram_of.size() && F->ram_of[key] >= 0);
+                s.ovf_used += ovf && !held;
+                s.ovf_backup += ovf && held;
+                s.ssd_only += !ovf && !held;
+                if (!ovf && !held) s.ssd_gb += (double) F->L[il].blob / 1073741824.0;
+            }
         }
     }
     if (fast_ != nullptr) {
@@ -5233,6 +5599,8 @@ bool Glm5Model::fast_boundary(std::string& err) {
         uint64_t bt = UINT64_MAX;
         for (int s = 0; s < R.n; ++s) {
             if (R.st[(size_t) s] != FastState::kRHold) continue;
+            // (STRATA_GLM_RAM_BACKUP: only an expert with a plain-RAM copy, which it falls back to - never the SSD)
+            if (F->ovf_guard && F->ovf[(size_t) R.key[(size_t) s]] == 0ull) continue;
             const uint64_t t = R.tick[(size_t) s];
             if (t < bt) {
                 bt = t;
@@ -5252,6 +5620,20 @@ bool Glm5Model::fast_boundary(std::string& err) {
         const char* v = getenv("STRATA_GLM_TIER_GC");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    // (0) the RAM watcher's new blobs of experts no tier holds (fast_ovf_watch): their RAM-tier entry, the CPU lane's
+    for (const auto& a : F->ovf_pending) {
+        const size_t key = (size_t) a.key;
+        if (F->ovf[key] != 0ull) {   // (a copy came meanwhile: this one goes)
+            glmfast::ovf_free((uint8_t*) a.p, glmfast::ovf_blob_bytes(F->L[key / (size_t) g.n_expert].blob), true,
+                              F->ovf_locked);
+            F->ovf_bytes -= glmfast::ovf_blob_bytes(F->L[key / (size_t) g.n_expert].blob);
+            continue;
+        }
+        F->ovf[key] = a.p;
+        F->ovf_own[key] = 2;
+        if (F->slot_of[key] < 0 && F->ram_of[key] < 0) upd(F->rtab_key((int) key), F->rtab_none((int) key));
+    }
+    F->ovf_pending.clear();
     // (1)
     for (size_t c = 0; c < F->rc.size(); ++c) {
         auto& R = F->rc[c];
@@ -5386,6 +5768,17 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 ++F->diag_resident_skip;
                 break;
             }
+            // STRATA_GLM_RAM_BACKUP: an expert with no plain-RAM copy never drops to the SSD - it is demoted over the
+            // RAM tier's victim (which has such a copy and falls back to it), or it stays in VRAM for now
+            bool forced = false;
+            if (rs < 0 && F->ovf_guard && F->rtab_none(vkey) == 0ull) {
+                rs = ram_victim(R);
+                if (rs < 0) {
+                    ++F->diag_resident_skip;
+                    break;
+                }
+                forced = true;
+            }
             // resident mode keeps the VRAM table entry live until the demotion's copy lands (the slot is
             // kDraining, so nothing overwrites it): a route mid-flight still hits VRAM
             if (!F->ram_resident) {
@@ -5397,7 +5790,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 rs = ram_victim(R);
                 if (rs >= 0) rc_min = F->cnt[(size_t) R.key[(size_t) rs]];
             }
-            if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRFree || rc_min < bc)) {
+            if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRFree || forced || rc_min < bc)) {
                 if (R.st[(size_t) rs] == FastState::kRHold) {
                     const int old = R.key[(size_t) rs];
                     F->left[(size_t) old] = 2;
@@ -5424,6 +5817,8 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 P.key[(size_t) v] = -1;
                 P.spare[j] = v;
                 upd(F->spare_key(il, j), (unsigned long long) P.slot_ptr(v));
+                // (its plain-RAM copy, when it has one - STRATA_GLM_RAM_BACKUP: the CPU lane's, not the SSD)
+                if (F->ram_of[(size_t) vkey] < 0) upd(F->rtab_key(vkey), F->rtab_none(vkey));
                 F->drops.fetch_add(1, std::memory_order_relaxed);
                 F->left[(size_t) vkey] = 1;
                 ++F->diag_drop;
@@ -5447,6 +5842,75 @@ bool Glm5Model::fast_boundary(std::string& err) {
             R.key[(size_t) best] = -1;
             R.st[(size_t) best] = FastState::kRFree;
             ++nfree;
+        }
+    }
+    // (4b) STRATA_GLM_RAM_OVERFLOW's experts climb: the hottest whose only copy is in plain RAM (the CPU lane's) goes
+    //      into the pinned tier when its aged count beats the class's victim by STRATA_GLM_OVF_CLIMB_MARGIN (2) - a
+    //      host copy - and from there the promotions take it on to VRAM as any other.  The victim falls back to its
+    //      own plain-RAM copy where it has one (else the SSD, as before).  STRATA_GLM_OVF_CLIMB moves a boundary (1; 0:
+    //      off): each is a ~7 MB copy on this thread between tokens.
+    static const int climb_n = [] {
+        const char* v = getenv("STRATA_GLM_OVF_CLIMB");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 1;
+    }();
+    static const uint32_t climb_margin = [] {
+        const char* v = getenv("STRATA_GLM_OVF_CLIMB_MARGIN");
+        return (uint32_t) (v != nullptr ? std::max(0, std::atoi(v)) : 2);
+    }();
+    if (climb_n > 0 && !F->ovf.empty() && !F->ram_resident && !F->bg_hold) {
+        std::vector<std::pair<uint32_t, int>> hot;   // (count, key) of the plain-RAM-only experts, hottest first
+        for (int il = l0_; il < lt_; ++il) {
+            if (!F->L[(size_t) il].moe) continue;
+            for (int e = 0; e < g.n_expert; ++e) {
+                const int key = il * g.n_expert + e;
+                if (F->ovf[(size_t) key] != 0ull && F->slot_of[(size_t) key] < 0 && F->ram_of[(size_t) key] < 0 &&
+                    F->cnt[(size_t) key] > climb_margin)
+                    hot.push_back({F->cnt[(size_t) key], key});
+            }
+        }
+        const size_t take = std::min(hot.size(), (size_t) climb_n * 4);
+        std::partial_sort(hot.begin(), hot.begin() + (ptrdiff_t) take, hot.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        int moved = 0;
+        for (size_t i = 0; i < take && moved < climb_n; ++i) {
+            const int key = hot[i].second, il = key / g.n_expert;
+            auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+            int nfree = 0, fs = -1;
+            for (int s = 0; s < R.n; ++s)
+                if (R.st[(size_t) s] == FastState::kRFree) {
+                    ++nfree;
+                    if (fs < 0) fs = s;
+                }
+            // the slot: a free one past those the disk reads keep, else the coldest held expert that HAS a plain-RAM
+            // copy (it falls back to that, never to the SSD) and no route used lately - else no climb
+            int rs = nfree > keep_free ? fs : -1;
+            if (rs < 0) {
+                uint32_t bc = UINT32_MAX;
+                for (int s = 0; s < R.n; ++s) {
+                    if (R.st[(size_t) s] != FastState::kRHold || R.tick[(size_t) s] + protect > F->clock) continue;
+                    const int k2 = R.key[(size_t) s];
+                    if (k2 < 0 || F->ovf[(size_t) k2] == 0ull || F->cnt[(size_t) k2] >= bc) continue;
+                    bc = F->cnt[(size_t) k2];
+                    rs = s;
+                }
+            }
+            if (rs < 0) continue;
+            if (R.st[(size_t) rs] == FastState::kRHold) {
+                const int old = R.key[(size_t) rs];
+                if (F->cnt[(size_t) old] + climb_margin >= hot[i].first) continue;   // (not hotter enough)
+                upd(F->rtab_key(old), F->rtab_none(old));
+                F->ram_of[(size_t) old] = -1;
+                F->left[(size_t) old] = 2;
+                ++F->diag_ram_evict;
+            }
+            std::memcpy(R.slot((size_t) rs), (const void*) F->ovf[(size_t) key], F->L[(size_t) il].blob);
+            R.key[(size_t) rs] = key;
+            R.tick[(size_t) rs] = F->clock;
+            R.st[(size_t) rs] = FastState::kRHold;
+            F->ram_of[(size_t) key] = rs;
+            upd(F->rtab_key(key), (unsigned long long) R.slot((size_t) rs));
+            F->ovf_climbs.fetch_add(1, std::memory_order_relaxed);
+            ++moved;
         }
     }
     // (5) background moves between the tiers, over the copy stream.  Where the CPU lane takes every RAM-tier expert

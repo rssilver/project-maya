@@ -135,6 +135,12 @@ public:
         int64_t pool_slots = 0, pool_used = 0, ram_slots = 0, ram_used = 0;
         double pool_gb = 0, ram_gb = 0;
         double all_gb = 0;   // every routed expert of this model, in GB (the Monitor's SSD-only share is what VRAM and RAM do not hold)
+        // STRATA_GLM_RAM_OVERFLOW's experts whose only copy is in plain RAM (the CPU lane's), its backup copies of
+        // experts VRAM or the pinned tier hold (STRATA_GLM_RAM_BACKUP), the plain RAM all of them take, and the experts
+        // no tier holds - in neither VRAM, the pinned RAM tier nor plain RAM: read from the SSD whenever a route picks them
+        int64_t ovf_used = 0, ovf_backup = 0, ssd_only = 0;
+        double ovf_gb = 0, ssd_gb = 0;
+        uint64_t ovf_climbs = 0;   // plain-RAM-only experts copied up into the pinned tier (fast_boundary's 4b)
     };
     FastStats fast_stats() const;
     /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total
@@ -567,6 +573,11 @@ public:
     int calc_pf_state_ = 0;      // 0 not tried, 1 on, -1 off
     void ram_left_check() const;
     void fast_destroy();
+    // STRATA_GLM_RAM_OVERFLOW's plain-RAM blobs: the RAM watcher's thread (gives backups back when RAM runs short, adds
+    // blobs when it frees up), a blob of one expert read from the pack, and freeing them all (the watcher stopped first)
+    void fast_ovf_watch();
+    uint8_t* fast_ovf_read(int key);
+    void fast_ovf_release_all();
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);
     bool fast_token(int32_t token, std::string& err);
     bool fast_layers(int64_t p, bool hop_in, std::string& err);

@@ -1779,6 +1779,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                 for (int s2 = 0; s2 < R.n; ++s2) {
                     if (R.st[(size_t) s2] != FastState::kRHold || parked[(size_t) R.key[(size_t) s2]]) continue;
                     const int k2 = R.key[(size_t) s2];
+                    if (F->ovf_guard && F->ovf[(size_t) k2] == 0ull) continue;   // (it would go to the SSD)
                     const uint32_t c = F->cnt[(size_t) k2], u = use(k2);
                     const uint64_t t = R.tick[(size_t) s2];
                     if (c < bc || (lru_ties && c == bc && (t < bt || (t == bt && u < bu)))) {
@@ -1851,7 +1852,10 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                             return false;
                         upd(F->tab_key((size_t) vkey), 0ull);
                         F->slot_of[(size_t) vkey] = -1;
-                        if (!parked) F->left[(size_t) vkey] = 3;
+                        if (!parked) {   // (to its plain-RAM copy when it has one - STRATA_GLM_RAM_BACKUP)
+                            F->left[(size_t) vkey] = 3;
+                            upd(F->rtab_key((size_t) vkey), F->rtab_none((int) vkey));
+                        }
                         upd(F->tab_key((size_t) key), (unsigned long long) P.slot_ptr(v));
                         F->slot_of[(size_t) key] = v;
                         P.key[(size_t) v] = P.key[(size_t) s];
@@ -1860,7 +1864,10 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                     } else {
                         upd(F->tab_key((size_t) key), 0ull);
                         F->slot_of[(size_t) key] = -1;
-                        if (!park(il, s, key)) F->left[(size_t) key] = 3;
+                        if (!park(il, s, key)) {
+                            F->left[(size_t) key] = 3;
+                            upd(F->rtab_key((size_t) key), F->rtab_none((int) key));
+                        }
                         if (!ok) return false;
                     }
                     ++dropped;

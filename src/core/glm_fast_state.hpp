@@ -901,7 +901,29 @@ struct Glm5Model::FastState {
     // the arena that holds them.  A RAM-tier entry the tiers let go of falls back to it (rtab_none), not to "disk"
     std::vector<unsigned long long> ovf;
     uint8_t* ovf_arena = nullptr;
-    size_t ovf_bytes = 0;
+    std::atomic<size_t> ovf_bytes{0};   // the plain RAM its blobs take now (the arena's committed ones and the watcher's)
+    // STRATA_GLM_RAM_BACKUP (on with the overflow): blobs in plain RAM are also BACKUP copies of experts VRAM or the
+    // pinned tier hold - the coldest first - so an expert those tiers let go of falls back to RAM (the CPU lane), never
+    // to the SSD.  ovf_own: key -> 0 none, 1 a blob of ovf_arena (decommitted when it goes), 2 a blob of its own (the
+    // RAM watcher's).  The blobs are locked in RAM where the OS allows it (STRATA_GLM_RAM_LOCK), so Windows cannot page
+    // them out to the SSD either
+    std::vector<uint8_t> ovf_own;
+    struct OvfAdd {
+        int key;
+        unsigned long long p;
+    };
+    std::vector<OvfAdd> ovf_pending;   // the watcher's blobs of experts no tier holds: published at the next boundary (mu)
+    std::thread ovf_watch;              // the RAM watcher (fast_ovf_watch): gives blobs back when RAM runs short, adds more
+    std::mutex ovf_wmu;                 // when it frees up
+    std::condition_variable ovf_wcv;
+    bool ovf_wquit = false;
+    double ovf_room = 6e9;              // the RAM the watcher leaves to the rest of the system (bytes)
+    bool ovf_locked = false;            // the blobs are locked in RAM (each new one is locked as well)
+    // backups on (and the CPU lane that answers them): the tiers let go only of experts with a plain-RAM copy - the RAM
+    // tier's victims are such experts, and a VRAM victim without one is demoted over them or stays (never the SSD)
+    bool ovf_guard = false;
+    bool ovf_fill = false;   // the backups are still to be read (the watcher's first rounds, back to back; then the guard)
+    std::atomic<uint64_t> ovf_climbs{0}, ovf_released{0}, ovf_added{0};
     unsigned long long rtab_none(int key) const {
         return (size_t) key < ovf.size() && ovf[(size_t) key] != 0ull ? (ovf[(size_t) key] | gf::kCpuOnly) : 0ull;
     }
