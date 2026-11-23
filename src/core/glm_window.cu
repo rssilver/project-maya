@@ -13,6 +13,7 @@
 // rewritten when its position is processed again, before any query reads it (a pooled indexer key is built from the
 // cached keys when its pool's last position is processed, and queries read only completed pools).
 #include "glm_fast_state.hpp"
+#include "glm_ablate.cuh"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -869,6 +870,11 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     const auto pre = [&](int il, int t0, int n, int moe_part, int gid) -> bool {
         const auto& Ly = F->L[(size_t) il];
         const int k = il - l0_;
+        if (il != l0_) {   // STRATA_GLM_ABLATE, as fast_layers: layer il - 1's FFN write of these tokens, both operands
+            glm_ablate::rows(W.ffn + (size_t) t0 * E, n, E, s);   // (outputs mode: the FFN's write)
+            glm_ablate::layer_rows(il - 1, W.ffn + (size_t) t0 * E, n, E, s);
+            glm_ablate::layer_rows(il - 1, W.R[rc_in[(size_t) k]] + (size_t) t0 * hcE, n * g.hc, E, s);
+        }
         hc_rows(il, true, rc_in[(size_t) k], t0, n);
         mark("hc");
         // the layer's input rows - the drafter's features when it reads this layer
@@ -903,6 +909,7 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
             if (!fast_dsa_window(il, p0, t0, n, err)) return false;
         }
         // ---- the FFN-side read (folds the mixer's write in)
+        glm_ablate::rows(W.mixer + (size_t) t0 * E, n, E, s);   // STRATA_GLM_ABLATE: the mixer's write
         hc_rows(il, false, rc_mid[(size_t) k], t0, n);
         mark("hc");
         if (!Ly.moe) {
@@ -959,6 +966,9 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     }
     // the last layer's write half: R (in the other buffer) = post x ffn + comb . R
     const int rc = rc_in[(size_t) (l1_ - l0_)];
+    glm_ablate::rows(W.ffn, T, E, s);   // STRATA_GLM_ABLATE: the last layer's FFN write (and per layer, both operands)
+    glm_ablate::layer_rows(l1_ - 1, W.ffn, T, E, s);
+    glm_ablate::layer_rows(l1_ - 1, W.R[rc], T * g.hc, E, s);
     for (int t = 0; t < T; ++t)
         gf::hc_post(W.ffn + (size_t) t * E, W.R[rc] + (size_t) t * hcE, W.post + (size_t) t * 8,
                     W.comb + (size_t) t * 16, E, W.R[rc ^ 1] + (size_t) t * hcE, s);
@@ -1044,6 +1054,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
             if (const float* img = image_row(p0 + t)) std::memcpy(row, img, (size_t) E * sizeof(float));
         }
         cudaMemcpyAsync(W.emb, W.emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, F->cs);
+        glm_ablate::rows(W.emb, T, E, F->cs);   // STRATA_GLM_ABLATE (outputs mode: the token embeddings)
         for (int t = 0; t < T; ++t)
             gf::embed_streams(W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, E, F->cs);
     }
@@ -1248,6 +1259,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     if (prev == nullptr) {
         cudaMemcpyAsync(W.emb + (size_t) sl * E, W.emb_h + (size_t) sl * E, (size_t) E * sizeof(float),
                         cudaMemcpyHostToDevice, F->cs);
+        glm_ablate::rows(W.emb + (size_t) sl * E, 1, E, F->cs);   // STRATA_GLM_ABLATE (outputs mode)
         gf::embed_streams(W.emb + (size_t) sl * E, m->state_, E, F->cs);
     } else {
         cudaStreamWaitEvent(F->cs, prev->fast_->win.ev_tok[sl], 0);

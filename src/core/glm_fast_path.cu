@@ -1195,8 +1195,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         pool_check(floor_b, stride_max, all_b);
         (void) glm_ablate::vec((int) g_.n_embd);   // STRATA_GLM_ABLATE: the direction on this device, before the pool is sized
         if (glm_ablate::on())
-            std::fprintf(stderr, "glm ablate: applied on the one-token decode and the prompt path only - not on "
-                         "batched rows (--parallel above 1) or a drafter's verify windows\n");
+            std::fprintf(stderr, "glm ablate: applied on the one-token decode, the prompt path and a drafter's verify "
+                         "windows - not on batched rows (--parallel above 1)\n");
         // STRATA_GLM_LORA: the adapter checked against the layers and put on this device, before the pool is sized
         glm_lora::setup((int) F->L.size(), [&](int il) {
             if (il < 0 || il >= (int) F->L.size() || il == mtp_il_) return 0;
