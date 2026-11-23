@@ -4250,24 +4250,35 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                         s_pp[i] = ptr;
                     } else if (a.scr_used != nullptr) {
                         // a verify window: a scratch slot no earlier token of the layer took
+                        // (n_scr slots, 8 or 16: the claims in the low n_scr bits of word 0, the staggered group's
+                        // own slots in the bits above them)
+                        const int ns = a.d.n_scr > 8 ? 16 : 8;
+                        const unsigned int all = ns == 16 ? 0xFFFFu : 0xFFu;
                         const unsigned int u = *a.scr_used;
                         int j = 0;
-                        while (j < 8 && ((u >> j) & 1u)) ++j;
-                        if (j < 8) {
+                        while (j < ns && ((u >> j) & 1u)) ++j;
+                        if (j < ns) {
                             *a.scr_used = u | (1u << j);
                             ptr = a.d.scratch[j];
+                        } else if (src != 0ull && a.cpu_plan != 0ull && a.d.cpu_seq != nullptr) {
+                            // no slot left, but the expert is in pinned RAM and the CPU lane answers this route: the
+                            // host computes it (as a CPU pick: a null plan entry) - no clash, so the window is not
+                            // redone token by token (an RTX 5090 with Maya-S's experts in RAM redid most windows)
+                            cpu |= 1u << i;
+                            s_cs[i] = src;
+                            src = 0ull;
                         } else {
                             a.scr_used[1] |= 0x80000000u;   // sticky for the window (word 0 resets each layer)
-                            // a staggered group (bits 8-15 of the word: its own slots) reuses one of ITS slots: the
+                            // a staggered group (the bits above the claims: its own slots) reuses one of ITS slots: the
                             // other group's still hold the experts of a layer it has yet to compute - maybe of another
                             // type, whose garbage can be non-finite, and after a non-finite route every later one is
                             // refused (the redo too)
-                            const unsigned int own = (u >> 8) & 0xFFu;
+                            const unsigned int own = (u >> ns) & all;
                             int f = i;
                             if (own != 0u) {
                                 const int n = i % __popc(own);
                                 f = 0;
-                                for (int c = 0; f < 8; ++f)
+                                for (int c = 0; f < ns; ++f)
                                     if (((own >> f) & 1u) && c++ == n) break;
                             }
                             ptr = a.d.scratch[f];
@@ -4276,7 +4287,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                         ptr = a.d.scratch[i];
                     }
                     if (src != 0ull) fetch |= 1u << i;
-                    else mask |= 1u << i;   // only on disk: the host provides the source
+                    else if (((cpu >> i) & 1u) == 0u) mask |= 1u << i;   // only on disk: the host provides the source
                 }
             }
             s_plan[i] = ptr;   // (out to the device's plan below, a thread an entry)

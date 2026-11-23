@@ -287,6 +287,25 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
 }
 
 // at setup, before the expert pool takes what is free: the window's buffers, the recurrent-state backup window_commit
+// The window's 16-entry scratch table - the decode's 8 slots, then win_scratch's 8 - once both exist (a no-op after)
+void Glm5Model::win_scratch_table() {
+    FastState* F = fast_;
+    if (F == nullptr || F->win_scr_n == 16 || F->win_scr_tab == nullptr || F->win_scratch == nullptr ||
+        F->scratch == nullptr)
+        return;
+    size_t blob_max = 0;
+    for (int il = l0_; il < l1_; ++il)
+        if (F->L[(size_t) il].moe) blob_max = std::max(blob_max, F->L[(size_t) il].blob);
+    const size_t sstride = (blob_max + 255u) & ~(size_t) 255u;   // (glm_fast_path's for the decode's slots)
+    unsigned long long sp[16];
+    for (int i = 0; i < 8; ++i) {
+        sp[i] = (unsigned long long) (F->scratch + (size_t) i * sstride);
+        sp[8 + i] = (unsigned long long) (F->win_scratch + (size_t) i * sstride);
+    }
+    if (cudaMemcpy(F->win_scr_tab, sp, sizeof sp, cudaMemcpyHostToDevice) == cudaSuccess) F->win_scr_n = 16;
+    else cudaGetLastError();
+}
+
 // restores (the KDA states and conv histories of this part) and the drafter's capture rows
 bool Glm5Model::win_reserve(std::string& err) {
     FastState* F = fast_;
@@ -306,6 +325,29 @@ bool Glm5Model::win_reserve(std::string& err) {
         cudaGetLastError();
         F->rep = nullptr;   // (the commit replays layer by layer)
     }
+    // the window's 8 more scratch slots and its 16-entry table (STRATA_GLM_WIN_SCRATCH=8: the decode's 8 only); the
+    // table is filled once the decode's slots exist (win_scratch_table)
+    static const int win_scr = [] {
+        const char* v = getenv("STRATA_GLM_WIN_SCRATCH");
+        return v != nullptr && std::atoi(v) <= 8 ? 8 : 16;
+    }();
+    if (win_scr == 16 && F->win_scratch == nullptr) {
+        size_t blob_max = 0;
+        for (int il = l0_; il < l1_; ++il)
+            if (F->L[(size_t) il].moe) blob_max = std::max(blob_max, F->L[(size_t) il].blob);
+        const size_t sstride = (blob_max + 255u) & ~(size_t) 255u;
+        if (blob_max > 0 && (cudaMalloc((void**) &F->win_scratch, 8 * sstride) != cudaSuccess ||
+                             cudaMalloc((void**) &F->win_scr_tab, 16 * sizeof(unsigned long long)) != cudaSuccess)) {
+            cudaGetLastError();
+            if (F->win_scratch) cudaFree(F->win_scratch);
+            F->win_scratch = nullptr;
+            F->win_scr_tab = nullptr;
+            std::fprintf(stderr, "glm window: 8 more scratch slots did not allocate - the window keeps the decode's 8\n");
+        } else if (blob_max > 0) {
+            F->scratch_bytes += 8 * sstride;
+        }
+    }
+    win_scratch_table();
     if (F->cap == nullptr) {
         if (cudaMalloc((void**) &F->cap, (size_t) kWinMax * g.n_embd * sizeof(float)) != cudaSuccess) {
             cudaGetLastError();
@@ -328,6 +370,11 @@ void Glm5Model::win_free() {
         if (e) cudaEventDestroy(e);
     if (W.skip_d) cudaFree(W.skip_d);
     if (W.from_h) cudaFreeHost((void*) W.from_h);
+    if (fast_->win_scratch) cudaFree(fast_->win_scratch);
+    if (fast_->win_scr_tab) cudaFree(fast_->win_scr_tab);
+    fast_->win_scratch = nullptr;
+    fast_->win_scr_tab = nullptr;
+    fast_->win_scr_n = 8;
     if (W.arena) cudaFree(W.arena);
     if (W.tok_h) cudaFreeHost(W.tok_h);
     if (W.emb_h) cudaFreeHost(W.emb_h);
@@ -598,6 +645,10 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
     if ((batch_env || multi) && !W.per_token && W.mplan_ptr != nullptr && (T > 1 || part != 0)) {
         const auto tok_dev = [&](int t) {
             gf::MoeDev mt = md;
+            if (F->win_scr_n == 16) {   // (the window's own table: the 8 decode slots and 8 more - win_scratch_table)
+                mt.scratch = F->win_scr_tab;
+                mt.n_scr = 16;
+            }
             mt.plan_ptr = W.mplan_ptr + 8 * t;
             mt.plan_w = W.mplan_w + 8 * t;
             mt.plan_id = W.mplan_id + 8 * t;
@@ -987,6 +1038,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         err = "glm window: needs the fast path and 1.." + std::to_string(kWinMax) + " tokens";
         return false;
     }
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->win_scratch_table();
     const Glm5Geometry& g = g_;
     const int E = g.n_embd;
     const size_t hcE = (size_t) g.hc * E;
@@ -1027,8 +1079,10 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
             cudaMemsetAsync(Wm.scr, 0, 4 * sizeof(unsigned int), m->fast_->cs);
             if (Wm.scr_h != nullptr) {
                 // (bits 8-15: the group's own slots, where a clash's fallback stays - moe_route)
-                Wm.scr_h[8] = 0xF0u | (0x0Fu << 8);
-                Wm.scr_h[9] = 0x0Fu | (0xF0u << 8);
+                // (16 slots - STRATA_GLM_WIN_SCRATCH, win_scratch_table: group A 0-7, group B 8-15, own bits 16-31)
+                const bool w16 = m->fast_->win_scr_n == 16;
+                Wm.scr_h[8] = w16 ? 0xFF00u | (0x00FFu << 16) : 0xF0u | (0x0Fu << 8);
+                Wm.scr_h[9] = w16 ? 0x00FFu | (0xFF00u << 16) : 0x0Fu | (0xF0u << 8);
                 cudaMemcpyAsync(Wm.scr + 8, Wm.scr_h + 8, 2 * sizeof(unsigned int), cudaMemcpyHostToDevice,
                                 m->fast_->cs);
             }
@@ -1112,6 +1166,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         if (Wm.scr_h != nullptr && ((Wm.scr_h[0] | Wm.scr_h[2]) & 0x80000000u) != 0u) clash = true;
     }
     if (clash && attempt == 0) {
+        ++fast_->win.h_clash;
         static bool told = false;
         if (!told) {
             told = true;
@@ -1720,11 +1775,13 @@ void Glm5Model::win_prof_report() {
     if (fast_ != nullptr && fast_->win.h_n > 0) {
         auto& W = fast_->win;
         const double n = (double) W.h_n;
-        std::fprintf(stderr, "glm window host (%lld windows): setup %.2f ms | enqueue %.2f ms | wait for the GPUs %.2f ms | "
-                             "after %.2f ms\n", (long long) W.h_n, W.h_setup / n, W.h_enqueue / n, W.h_wait / n,
+        std::fprintf(stderr, "glm window host (%lld windows, %lld redone token by token after a scratch clash): setup "
+                             "%.2f ms | enqueue %.2f ms | wait for the GPUs %.2f ms | after %.2f ms\n",
+                     (long long) W.h_n, (long long) W.h_clash, W.h_setup / n, W.h_enqueue / n, W.h_wait / n,
                      W.h_after / n);
         W.h_setup = W.h_enqueue = W.h_wait = W.h_after = 0;
         W.h_n = 0;
+        W.h_clash = 0;
     }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) continue;

@@ -578,6 +578,7 @@ public:
     void fast_ovf_watch();
     uint8_t* fast_ovf_read(int key);
     void fast_ovf_release_all();
+    void win_scratch_table();   // the verify window's 16-entry scratch table, once the decode's slots exist
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);
     bool fast_token(int32_t token, std::string& err);
     bool fast_layers(int64_t p, bool hop_in, std::string& err);

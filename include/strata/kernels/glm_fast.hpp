@@ -285,6 +285,7 @@ struct MoeDev {
     const uint8_t* helper_owned = nullptr;      // optional GLM helper ownership, checked before primary admission
     int n_keys = 0;                            // N = n_layers * n_expert
     unsigned long long* scratch = nullptr;     // [8] VRAM slots for fetched experts that could not be promoted
+    int n_scr = 8;                             // a verify window's route (scr_used): the slots it may claim, 8 or 16
     unsigned long long* plan_ptr = nullptr;    // [8]
     float* plan_w = nullptr;                   // [8]
     int* plan_id = nullptr;                    // [8]

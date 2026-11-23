@@ -388,6 +388,12 @@ struct Glm5Model::FastState {
     void* arena = nullptr;
     size_t arena_bytes = 0;
     size_t scratch_bytes = 0, win_bytes = 0;   // the scratch slots; the verify window's buffers (the VRAM report)
+    // the verify window's own scratch table (STRATA_GLM_WIN_SCRATCH, 16; 8 = the decode's 8 only): the decode's 8 slots
+    // and 8 more, so a window's tokens rarely take more than a layer has (each time they do the window runs again
+    // token by token: an RTX 5090 with Maya-S's experts from RAM did so in most windows, ~2x the round's time)
+    uint8_t* win_scratch = nullptr;
+    unsigned long long* win_scr_tab = nullptr;
+    int win_scr_n = 8;
     // activations (device)
     float *x = nullptr, *mixer = nullptr, *ffn = nullptr, *pre = nullptr, *post = nullptr, *comb = nullptr;
     float* defer_post = nullptr;   // STRATA_GLM_DEFER_CPU: the deferred layer's FFN-side post weights (8 floats)
@@ -752,6 +758,7 @@ struct Glm5Model::FastState {
         int64_t n_prof = 0;
         double h_setup = 0, h_enqueue = 0, h_wait = 0, h_after = 0;   // window()'s host phases (the first part's)
         int64_t h_n = 0;
+        int64_t h_clash = 0;   // of those windows, the ones whose tokens took more scratch slots than a layer has (redone)
         // STRATA_GLM_WIN_UNION=1: each MoE layer's routed experts per window token (device, layers x kWinMax x 8), and
         // the distinct experts a window's layer routes against its picks (how much computing each expert once would save)
         int* uid = nullptr;
