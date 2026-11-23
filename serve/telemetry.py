@@ -683,6 +683,21 @@ class _Pdh:
         return out
 
 
+class _ProcVram(_Pdh):
+    """Windows only: each process's dedicated GPU memory (the GPU Process Memory counters, Task Manager's "Dedicated GPU
+    memory" column).  When the card is full, Windows' driver moves allocations of a running program out of VRAM into
+    system RAM without telling it - a CUDA engine keeps running, much slower (a 3 GB allocation beside a running Maya-S
+    took 2.2 GB of its dedicated memory, and a real session dropped from ~25 to ~12 tok/s that way).  That shows here
+    as the engine process's dedicated usage falling below its own peak.  (The "Shared Usage" counter is no use for
+    this: it counts the pinned RAM the engine holds for its experts too, tens of GB.)"""
+    COUNTERS = {"dedicated": r"\GPU Process Memory(*)\Dedicated Usage"}
+
+    def dedicated(self, pid):
+        """The process's dedicated GPU memory in bytes (all its adapters), or None when it is not listed."""
+        vals = [v for name, v in self.values().get("dedicated", ()) if name.lower().startswith(f"pid_{pid}_")]
+        return int(sum(vals)) if vals else None
+
+
 def win_gpu_reading(values, luid):
     """The readings of the adapter `luid` ("luid_0x00000000_0x0000d1a3") from _Pdh.values(): the load is the busiest
     engine's (each engine's processes summed, as Task Manager counts it - not Linux's whole-card busy percent), the
@@ -859,7 +874,7 @@ class _CpuRamFallback:
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
     def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, reader: _Reader | None = None,
-                 start=True, busy=None):
+                 start=True, busy=None, engine_pid=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
@@ -870,8 +885,13 @@ class Telemetry:
         (else sample() only); `busy()` -> whether a request is running: while none is and nobody has read the numbers
         for WATCH_S, the sampler pauses IDLE_S between readings instead of 1 s (issue #685: every reading wakes the
         server and the NVML process - for numbers nobody looks at); a reader of the numbers (snapshot) or touch()
-        returns it to once a second at once."""
+        returns it to once a second at once.  `engine_pid()` -> the engine's process id (None: none running): on
+        Windows its dedicated GPU memory is read (engine_vram) with its peak since that process started, and what it
+        lost from the peak (engine_vram_spill: Windows moved that much of it into system RAM, see _ProcVram)."""
         self.extra = extra
+        self.engine_pid = engine_pid
+        self.procvram = None                         # (_ProcVram, made on the first reading with an engine running)
+        self._peak = (None, 0)                       # (pid, the highest dedicated usage it had)
         self.busy = busy
         self.watched_at = time.monotonic()           # (starts watched: the first readings come at the usual pace)
         self._wake = threading.Event()
@@ -980,12 +1000,36 @@ class Telemetry:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
+        s.update(self._engine_vram())
         if self.extra:
             try:
                 s.update(self.extra())
             except Exception:  # noqa: BLE001 - telemetry must never take the server down
                 pass
         return s
+
+    def _engine_vram(self) -> dict:
+        """Windows: the engine process's dedicated GPU memory, its peak and what it lost of it (bytes); {} elsewhere,
+        with no engine, or when the counters cannot be read."""
+        if not WINDOWS or self.engine_pid is None:
+            return {}
+        try:
+            pid = self.engine_pid()
+        except Exception:  # noqa: BLE001 - not known
+            return {}
+        if not pid:
+            self._peak = (None, 0)
+            return {}
+        if self.procvram is None:
+            self.procvram = _ProcVram()
+        if not self.procvram.ok():
+            return {}
+        used = self.procvram.dedicated(pid)
+        if used is None:
+            return {}
+        peak = max(used, self._peak[1]) if self._peak[0] == pid else used
+        self._peak = (pid, peak)
+        return {"engine_vram": used, "engine_vram_peak": peak, "engine_vram_spill": peak - used}
 
     def touch(self) -> None:
         """Someone looks at the numbers, or a request starts: back to once a second, now."""

@@ -98,6 +98,11 @@
 .tierbar__vram { background: var(--st-accent); }
 .tierbar__ram { background: var(--st-info); }
 .tierbar__disk { background: var(--st-warn); }
+.tierbar__ovf, .sw.sw--ovf { background: color-mix(in srgb, var(--st-info) 55%, var(--st-ok)); }
+.tierstate { display: flex; align-items: center; gap: 8px; margin: 0; font-size: var(--st-fs-md); }
+.tierstate__dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.tierstate--ok { color: var(--st-ok); } .tierstate--ok .tierstate__dot { background: var(--st-ok); }
+.tierstate--warn { color: var(--st-warn); } .tierstate--warn .tierstate__dot { background: var(--st-warn); }
 .legend { display: flex; flex-wrap: wrap; gap: 8px 28px; font-size: var(--st-fs-md); color: var(--st-ink-muted); }
 .legend--sm { gap: 6px 20px; font-size: var(--st-fs-sm); }
 .legend > span, .legend__item { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }

@@ -2684,6 +2684,11 @@ class Service:
                 pass
         return "\n".join(out) + "\n"
 
+    def _engine_pid(self):
+        """The running engine's process id (the sampler reads its dedicated VRAM on Windows), else None."""
+        proc = getattr(getattr(self, "engine", None), "proc", None)
+        return proc.pid if proc is not None and proc.poll() is None else None
+
     def start_telemetry(self):
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
@@ -2693,7 +2698,8 @@ class Service:
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        amd=getattr(self, "backend", None) == "hip",
-                                       busy=lambda: bool(self.active or self.status.get("busy") or self.status.get("queued")))
+                                       busy=lambda: bool(self.active or self.status.get("busy") or self.status.get("queued")),
+                                       engine_pid=self._engine_pid)
             if isinstance(self.engine, StrataEngine):
                 self.engine.gpu_busy = self._gpu_busy     # the stall watchdog's third sign of work
         self.start_queue_watch()

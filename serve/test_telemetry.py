@@ -201,6 +201,33 @@ class Sampler(unittest.TestCase):
         self.assertNotIn("gpu_procs", s)
         json.dumps(t.snapshot())
 
+    def test_the_engines_vram_spill_from_its_peak(self):   # (Windows: the engine's dedicated usage under its peak)
+        class FakeProcVram:
+            def __init__(self):
+                self.by_pid = {}
+
+            def ok(self):
+                return True
+
+            def dedicated(self, pid):
+                return self.by_pid.get(pid)
+        pid = [100]
+        r = reader(absent=True)
+        with mock.patch.object(T, "SYSFS", str(ROOT / "no-such-sysfs")), mock.patch.object(T, "WINDOWS", True):
+            t = T.Telemetry(gpu_index=0, reader=r, start=False, engine_pid=lambda: pid[0])
+            t.procvram = fake = FakeProcVram()
+            fake.by_pid[100] = 28 << 30
+            self.assertEqual(t._engine_vram()["engine_vram_spill"], 0)
+            fake.by_pid[100] = 26 << 30                  # (another program took VRAM: Windows moved 2 GB of it)
+            self.assertEqual(t._engine_vram(), {"engine_vram": 26 << 30, "engine_vram_peak": 28 << 30,
+                                                "engine_vram_spill": 2 << 30})
+            pid[0], fake.by_pid[200] = 200, 20 << 30     # (a restart: a new process, its own peak)
+            self.assertEqual(t._engine_vram()["engine_vram_spill"], 0)
+            pid[0] = None
+            self.assertEqual(t._engine_vram(), {})
+        with mock.patch.object(T, "WINDOWS", False):
+            self.assertEqual(t._engine_vram(), {})
+
     def test_without_nvml(self):
         r = reader(absent=True)
         # (nor an AMD card: AmdSysfs and AmdWindows have those)

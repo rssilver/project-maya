@@ -25,6 +25,29 @@ const Num = ({v, unit}) => html`<span class="stat__value">${v == null ? "–" : 
 const Badge = ({tone, children}) => html`<span class=${`badge badge--${tone}`}><i class="badge__dot"></i>${children}</span>`;
 
 // ------------------------------------------------------------------ problems worth a line at the top
+// Memory running short under the model (tools/setup_dash.py's memory_warnings says the same on Maya's screen): the
+// engine's VRAM that Windows moved into system RAM (its dedicated usage under its own peak - answers slow down until a
+// restart), VRAM or RAM nearly full, and experts read from the SSD
+const SPILL_MIB = 256, VRAM_LOW_MIB = 300, RAM_LOW_GIB = 2;
+const GiB = 2 ** 30, MiB = 2 ** 20;
+export function memoryWarnings(m) {
+  const hw = m.hardware || {}, out = [];
+  const spill = hw.engine_vram_spill || 0;
+  if (spill >= SPILL_MIB * MiB) {
+    out.push(["danger", `Windows moved ${fmt(spill / GiB, 1)} GB of Maya's GPU memory into system RAM: the GPU ran out of VRAM. Answers stay slower until Maya restarts. Close other programs that use the GPU (games, video, emulators), or raise --vram-reserve-mib.`]);
+  } else if (hw.gpu_mem_total && hw.gpu_mem_used != null && hw.gpu_mem_total - hw.gpu_mem_used < VRAM_LOW_MIB * MiB) {
+    out.push(["warn", `Only ${fmt((hw.gpu_mem_total - hw.gpu_mem_used) / MiB)} MiB of VRAM free: a program that takes more makes Windows move part of Maya into system RAM, and answers slow down.`]);
+  }
+  if (hw.ram_total && hw.ram_used != null && hw.ram_total - hw.ram_used < RAM_LOW_GIB * GiB) {
+    out.push(["warn", `Only ${fmt((hw.ram_total - hw.ram_used) / GiB, 1)} GB of RAM free: Windows may page experts Maya keeps in plain RAM out to the SSD. Close programs to give it room.`]);
+  }
+  const n = (m.tiers || {}).now || {};
+  if (n.ssd_only > 0 && n.time && Date.now() / 1000 - n.time <= 30) {
+    out.push(["warn", `${fmt(n.ssd_only)} experts are not in RAM: Maya reads them from the SSD (${fmt(n.disk || 0, 2)} a token), which is slower.`]);
+  }
+  return out;
+}
+
 function Banners({m}) {
   const out = [];
   const rl = m.reload;
@@ -41,6 +64,7 @@ function Banners({m}) {
   for (const g of gpus) {
     if (g.temp != null && g.temp >= 87) out.push(["warn", `${g.index == null ? "The GPU" : `GPU ${g.index}`} is at ${fmt(g.temp)} °C: it may slow itself down to cool off.`]);
   }
+  out.push(...memoryWarnings(m));
   if (!out.length) return null;
   return html`<div class="banners">${out.map(([k, t]) => html`<div class=${`callout callout--${k}`} role=${k === "danger" ? "alert" : "status"}>
     <${Icon} name=${k === "info" ? "info" : k === "danger" ? "error" : "warning"} sm/><span>${t}</span></div>`)}</div>`;
@@ -221,7 +245,10 @@ function Tiers({t, eng}) {
   const age = n.time ? Math.max(0, Date.now() / 1000 - n.time) : null;
   const stale = age != null && age > 30;               // a reading from the last answer, not live
   // VRAM, RAM and the rest on the SSD - DeepSeek's (maya-ds4) the same keys: its RAM the copies or the read-ahead
-  const {vu, ru, total, disk, vramGb, ramGb, diskGb} = tierShares(n, eng || {});
+  const {vu, ru, ov, total, disk, known, vramGb, ramGb, ovGb, diskGb} = tierShares(n, eng || {});
+  // (a newer GLM engine counts the experts on the SSD only: every expert in VRAM or RAM is worth saying, and so is the SSD)
+  const where = !known ? null : disk === 0 ? ["ok", "Every expert is in VRAM or RAM: nothing is read from the SSD."]
+    : ["warn", `${fmt(disk)} experts are on the SSD only - ${fmt(n.disk || 0, 2)} read from it a token.`];
   let tip = "";
   if (ds4) {
     if (!stale && n.disk_mb != null && n.disk_mb >= 500) tip = "Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and answers get faster.";
@@ -239,12 +266,15 @@ function Tiers({t, eng}) {
   return html`<section class=${`card${stale ? " is-stale" : ""}`} aria-label="Where the experts live">
     <div class="card__head"><span class="card__title">${helper ? "Primary cache and RAM backing" : "Where the experts live"}</span>
       <span class="card__sub">${age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer` : `live · ${fmt(total)} routed experts`}</span></div>
-    <div class="tierbar" role="img" aria-label=${`${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in ${ds4 ? "RAM" : "pinned RAM"}, ${fmt(pc(disk), 0)}% on the SSD only`}>
+    ${where ? html`<p class=${`tierstate tierstate--${where[0]}`} role="status"><i class="tierstate__dot"></i>${where[1]}</p>` : null}
+    <div class="tierbar" role="img" aria-label=${`${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in ${ds4 ? "RAM" : "pinned RAM"}, ${ov ? `${fmt(pc(ov), 0)}% in plain RAM, ` : ""}${fmt(pc(disk), 0)}% on the SSD only`}>
       <span class="tierbar__vram" style=${`flex-grow:${vu}`}></span><span class="tierbar__ram" style=${`flex-grow:${ru}`}></span>
+      ${ov ? html`<span class="tierbar__ovf" style=${`flex-grow:${ov}`}></span>` : null}
       <span class="tierbar__disk" style=${`flex-grow:${disk}`}></span></div>
     <div class="legend">
       <span><i class="sw sw--vram"></i>${helper ? "Primary VRAM" : "VRAM"} <b class="num">${fmt(vu)} · ${fmt(vramGb, 1)} GB</b></span>
       <span><i class="sw sw--ram"></i>${ds4 ? "RAM" : "Pinned RAM"} <b class="num">${fmt(ru)} · ${fmt(ramGb, 1)} GB</b></span>
+      ${ov || n.ovf_backup ? html`<span title="Experts in plain RAM that the CPU computes (MAYA_GLM_RAM_OVERFLOW), and backup copies of experts VRAM or pinned RAM hold, so none falls back to the SSD"><i class="sw sw--ovf"></i>Plain RAM <b class="num">${fmt(ov)} · ${fmt(ovGb, 1)} GB${n.ovf_backup ? `, +${fmt(n.ovf_backup)} backups` : ""}</b></span>` : null}
       <span><i class="sw sw--disk"></i>SSD only <b class="num">${fmt(disk)}${diskGb == null ? "" : ` · ${fmt(diskGb, 1)} GB`}</b></span></div>
     <div class=${`tiles${set.length === 4 ? " tiles--4" : ""}`}>
       ${set.map((x) => {

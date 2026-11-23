@@ -197,19 +197,29 @@ def tiers(m: dict, width: int):
         ru = int(eng.get("ram_experts") or 0) if tier else int(eng.get("cpu_experts") or 0)
         disk = max(0, int(eng.get("cpu_experts") or 0) - ru) if tier else 0
         total = max(1, vu + ru + disk)
+        ov, ssd = 0, None
     else:
         vu, ru = n.get("vram_used") or 0, n.get("ram_used") or 0
         total = eng.get("experts") or max(1, vu + ru)
-        disk = max(0, total - vu - ru)
-    whole = max(total, vu + ru)                         # (the RAM tier can hold experts VRAM has too: never wider)
+        ssd = ssd_split(n, total)
+        ov, disk = ssd if ssd else (0, max(0, total - vu - ru))
+    whole = max(total, vu + ru + ov)                    # (the RAM tier can hold experts VRAM has too: never wider)
     cols = [round(width * vu / whole)]
     cols.append(min(width - cols[0], round(width * ru / whole)))
-    line = Text.assemble(gradient("█" * cols[0]), ("█" * cols[1], INFO_TEXT), ("█" * max(0, width - sum(cols)), WARN))
+    cols.append(min(width - sum(cols), round(width * ov / whole)))
+    if not ds4 and ssd and not disk:                    # (every expert in VRAM or RAM: no SSD share, whatever rounds)
+        cols[2] = width - cols[0] - cols[1]
+    line = Text.assemble(gradient("█" * cols[0]), ("█" * cols[1], INFO_TEXT), ("█" * cols[2], ACCENT2),
+                         ("█" * max(0, width - sum(cols)), WARN))
     legend = Table.grid(padding=(0, 1))
     parts = (((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "Pinned RAM", ru, ""), (WARN, "SSD only", disk, "")) if tier else
              ((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "RAM cache / SSD (in place)", ru, ""))) if ds4 else \
         ((ACCENT, "VRAM", vu, f" · {fmt(n.get('vram_gb'), 1)} GB"),
-         (INFO_TEXT, "Pinned RAM", ru, f" · {fmt(n.get('ram_gb'), 1)} GB"), (WARN, "SSD only", disk, ""))
+         (INFO_TEXT, "Pinned RAM", ru, f" · {fmt(n.get('ram_gb'), 1)} GB"),
+         *(((ACCENT2, "Plain RAM", ov, f" · {fmt(n.get('ovf_gb'), 1)} GB (CPU lane)" +
+             (f", +{fmt(n['ovf_backup'])} backups" if n.get("ovf_backup") else "")),)
+           if ov or n.get("ovf_backup") else ()),
+         (WARN, "SSD only", disk, ""))
     for color, what, k, extra in parts:
         legend.add_row(Text("■", color), Text(what, MUTED), Text(fmt(k), f"bold {INK}"), Text("experts" + extra, MUTED))
     rows = Table.grid(padding=(0, 2))
@@ -228,8 +238,29 @@ def tiers(m: dict, width: int):
         tips = () if stale else TIPS["disk"] if (n.get("disk") or 0) >= 3 else \
             TIPS["ram"] if (n.get("vram_hit") or 1) < 0.85 and (n.get("ram_fetch") or 0) >= 4 else ()
     tip = next((t for t in tips if len(t) <= width), tips[-1] if tips else "")   # (one line: the longest that fits)
-    return Group(line, legend, Text(""), rows,
+    where = ssd_state(m)
+    head = [Text.assemble(("● ", f"bold {where[1]}"), (where[0], where[1]))] if where else []
+    return Group(*head, line, legend, Text(""), rows,
                  *([Text(tip, f"italic {INK_SOFT}", no_wrap=True, overflow="ellipsis")] if tip else []))
+
+
+def ssd_split(n: dict, total) -> tuple | None:
+    """The GLM engine's STAT (0.1.49+ with ovf_used/ssd_only): (experts in plain RAM for the CPU lane, experts on the
+    SSD only); None from an older engine, whose SSD-only share is what VRAM and pinned RAM do not hold."""
+    if n.get("ssd_only") is None:
+        return None
+    return int(n.get("ovf_used") or 0), int(n["ssd_only"])
+
+
+def ssd_state(m: dict) -> tuple | None:
+    """Whether the GLM engine reads experts from the SSD: (the line, its colour), or None when it does not say."""
+    n = (m.get("tiers") or {}).get("now") or {}
+    if (m.get("engine") or {}).get("engine_kind") == "ds4" or n.get("ssd_only") is None:
+        return None
+    k, reads = int(n["ssd_only"]), n.get("disk") or 0
+    if k == 0:
+        return "Every expert is in VRAM or RAM: nothing is read from the SSD.", OK
+    return (f"{fmt(k)} experts are on the SSD only - {fmt(reads, 2)} read from it a token.", WARN)
 
 
 def tiers_sub(m: dict) -> Text:
@@ -340,6 +371,38 @@ def requests(m: dict, width: int, rows: int = 8):
     return Group(*out)
 
 
+SPILL_MIB = 256      # the engine's dedicated VRAM this far under its peak: Windows moved it into system RAM
+VRAM_LOW_MIB = 300   # free VRAM under this: one more program on the GPU and Windows starts moving the engine's
+RAM_LOW_GIB = 2.0    # free RAM under this: Windows pages out what is not locked - the plain-RAM experts among it
+
+
+def memory_warnings(m: dict) -> list:
+    """[(tone, message)] when memory runs short under the model (serve/web/monitor.js says the same): the engine's
+    VRAM moved into system RAM by Windows (the engine_vram_spill reading - answers slow down until a restart), VRAM
+    nearly full, RAM nearly full, and experts read from the SSD."""
+    hw, out = m.get("hardware") or {}, []
+    spill = hw.get("engine_vram_spill") or 0
+    if spill >= SPILL_MIB << 20:
+        out.append(("danger", f"Windows moved {gb(spill)} GB of Maya's GPU memory into system RAM: the GPU ran out of "
+                              "VRAM. Answers stay slower until Maya restarts. Close other programs that use the GPU "
+                              "(games, video, emulators), or raise --vram-reserve-mib."))
+    elif hw.get("gpu_mem_total") and hw.get("gpu_mem_used") is not None:
+        free = hw["gpu_mem_total"] - hw["gpu_mem_used"]
+        if free < VRAM_LOW_MIB << 20:
+            out.append(("warn", f"Only {fmt(free / 2**20)} MiB of VRAM free: a program that takes more makes Windows "
+                                "move part of Maya into system RAM, and answers slow down."))
+    if hw.get("ram_total") and hw.get("ram_used") is not None:
+        free = hw["ram_total"] - hw["ram_used"]
+        if free < RAM_LOW_GIB * 2**30:
+            out.append(("warn", f"Only {gb(free)} GB of RAM free: Windows may page experts Maya keeps in plain RAM out "
+                                "to the SSD. Close programs to give it room."))
+    n = (m.get("tiers") or {}).get("now") or {}
+    if n.get("ssd_only") and time.time() - (n.get("time") or 0) <= 30:
+        out.append(("warn", f"{fmt(n['ssd_only'])} experts are not in RAM: Maya reads them from the SSD "
+                            f"({fmt(n.get('disk') or 0, 2)} a token), which is slower."))
+    return out
+
+
 def banners(m: dict, fails: int) -> Text:
     """What the Monitor puts above everything: a reload, a hot GPU, a server that stopped answering."""
     out = []
@@ -350,6 +413,7 @@ def banners(m: dict, fails: int) -> Text:
     for g in (m.get("hardware") or {}).get("gpus") or []:
         if (g.get("temp") or 0) >= 87:
             out.append((f"GPU {g.get('index')} is at {fmt(g['temp'])} °C: it may slow itself down to cool off.", WARN))
+    out += [(msg, DANGER if tone == "danger" else WARN) for tone, msg in memory_warnings(m)]
     if fails >= 3:
         out.append(("The server does not answer: these numbers are from before.", DANGER))
     return Text("\n").join(Text.assemble(("! ", f"bold {tone}"), (msg, tone)) for msg, tone in out)

@@ -107,9 +107,14 @@ export function tierShares(n, eng = {}) {
   const ds4 = eng.engine_kind === "ds4";
   const vu = n.vram_used || 0, ru = n.ram_used || 0;
   const total = (ds4 ? vu + (n.cpu_n != null ? n.cpu_n : +eng.cpu_experts || 0) : eng.experts) || Math.max(1, vu + ru);
-  const disk = Math.max(0, total - vu - ru);
+  // the GLM engine 0.1.49+ says how many experts sit in plain RAM for its CPU lane (ovf_used: STRATA_GLM_RAM_OVERFLOW)
+  // and how many are on the SSD only (ssd_only); an older one: the SSD-only share is what VRAM and pinned RAM do not hold
+  const known = !ds4 && typeof n.ssd_only === "number";
+  const ov = known ? n.ovf_used || 0 : 0;
+  const disk = known ? n.ssd_only : Math.max(0, total - vu - ru);
   const gbOf = (x) => (typeof x === "number" && Number.isFinite(x) ? x : null);
-  return {vu, ru, total, disk, vramGb: gbOf(n.vram_gb), ramGb: gbOf(n.ram_gb), diskGb: gbOf(n.disk_gb)};
+  return {vu, ru, ov, total, disk, known, vramGb: gbOf(n.vram_gb), ramGb: gbOf(n.ram_gb), ovGb: gbOf(n.ovf_gb),
+          diskGb: gbOf(n.disk_gb)};
 }
 
 // ------------------------------------------------------------------ MCP servers (GET /mcp)

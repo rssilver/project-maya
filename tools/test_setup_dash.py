@@ -107,6 +107,33 @@ class Boxes(unittest.TestCase):
         self.assertIn("GPU 1 is at 88 °C", D.banners(METRICS, 0).plain)
         self.assertIn("does not answer", D.banners(METRICS, 3).plain)
 
+    def test_memory_warnings(self):   # (Windows moved the engine's VRAM into RAM; VRAM, RAM nearly full; the SSD)
+        hw = {"gpu_mem_total": 32 << 30, "gpu_mem_used": 20 << 30, "ram_total": 128 << 30, "ram_used": 100 << 30}
+        tiers = {"now": {**METRICS["tiers"]["now"], "ovf_used": 399, "ovf_gb": 2.6, "ssd_only": 0}}
+        calm = {**METRICS, "hardware": hw, "tiers": tiers}
+        self.assertEqual(D.memory_warnings(calm), [])
+        said = D.banners({**calm, "hardware": {**hw, "engine_vram_spill": 2 << 30, "gpu_mem_used": (32 << 30) - (100 << 20)}},
+                         0).plain
+        self.assertIn("Windows moved 2.0 GB of Maya's GPU memory into system RAM", said)
+        self.assertNotIn("MiB of VRAM free", said)                 # (the move says more than the free VRAM)
+        self.assertIn("Only 100 MiB of VRAM free",
+                      D.banners({**calm, "hardware": {**hw, "gpu_mem_used": (32 << 30) - (100 << 20)}}, 0).plain)
+        self.assertIn("Only 1.5 GB of RAM free",
+                      D.banners({**calm, "hardware": {**hw, "ram_used": (128 << 30) - (3 << 29)}}, 0).plain)
+        ssd = {**calm, "tiers": {"now": {**tiers["now"], "ssd_only": 120, "disk": 2.5}}}
+        self.assertIn("120 experts are not in RAM", D.banners(ssd, 0).plain)
+
+    def test_where_the_experts_live_with_plain_ram_and_no_ssd(self):   # (the engine's ovf_used / ssd_only, 0.1.49+)
+        now = {**METRICS["tiers"]["now"], "ovf_used": 399, "ovf_gb": 2.6, "ssd_only": 0}
+        out = text(D.tiers({**METRICS, "tiers": {**METRICS["tiers"], "now": now}}, 56))
+        for want in ("Every expert is in VRAM or RAM", "Plain RAM", "399", "2.6 GB (CPU lane)"):
+            self.assertIn(want, out)
+        self.assertRegex(out, r"SSD only\s+0\s+experts")
+        now["ssd_only"], now["disk"] = 75, 1.25
+        out = text(D.tiers({**METRICS, "tiers": {**METRICS["tiers"], "now": now}}, 56))
+        self.assertIn("75 experts are on the SSD only - 1.25 read from it a token", out)
+        self.assertNotIn("Every expert", text(D.tiers(METRICS, 56)))   # (an older engine does not say)
+
     def test_an_empty_server_is_no_error(self):            # (before the first request, or a server just started)
         empty = {"engine": {}, "live": {"state": "idle"}, "hardware": {}, "history": {}}
         for box in (D.speed(empty, 40), D.tiers(empty, 40), D.gpus(empty), D.hardware(empty, 80),
