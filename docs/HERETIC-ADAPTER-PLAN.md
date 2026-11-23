@@ -1,7 +1,7 @@
 # Plan: running a Heretic LoRA adapter on Maya's GLM engine
 
-Working notes for branch `windows-ram-overflow` (fork `rssilver/project-maya`, remote `fork`). Status: planned, not
-started. Context summary at the end.
+Working notes (fork `rssilver/project-maya`, remote `fork`). Status: steps 1-8 done on branch `heretic-adapter`
+(`MAYA_GLM_LORA`, `src/core/glm_lora.cuh`, 2026-11-22); results at the end. Open: step 6's batched prompt path. Context summary at the end.
 
 ## The adapter
 
@@ -79,3 +79,17 @@ A plan entry with `plan_ptr == 0` is not computed on the GPU (CPU lane, CPU-only
   adapter into the files would need Maya's unpublished imatrix: hence the runtime approach).
 - **Repo**: local checkout is v1.1.49; upstream (`origin`, mw00/project-maya) is v1.1.73+. Untracked
   `maya-bench-2026-11-10.txt` is the old Nov 10 benchmark.
+
+## Results (2026-11-22, RTX 5090, Maya-S-v2-IQ2_XXS, Heretic V3, greedy, thinking off)
+
+- **Off = unchanged**: with `MAYA_GLM_CPU_LANE=0` and prompts token by token (the stock engine is not repeatable across
+  starts otherwise - base vs base parted after 22-42 tokens), 4 x 96-token answers and 8 checks identical to the build
+  before the change.
+- **Exact**: one token's dumps (`GLM_CB_DIR`): every adapted layer's mixer difference (25 layers), FFN difference
+  (26 layers: shared + GPU-routed entries) and CPU-lane answer difference (19 layers) match `B (A . x)` from numpy on
+  the dumped inputs: relative error <= 5e-5, CPU lane <= 2e-8 absolute (float32 rounding of the answer).
+- **Effect**: 16 mildly harmful prompts (lock picking, a fake review, a phishing email, a fake ID, ...; 80 tokens):
+  stock refused 13; alesha-pro vector 0 (all direct); Heretic 0 (14 direct, 2 hedged "general information" answers).
+  8 of 8 answer checks right in all three.
+- **Speed** (the bench's three questions, 256 tokens): Heretic 30.9 / 35.4 / 32.5, stock 31.3 / 34.3 / 30.6 tok/s -
+  no cost above the noise; a 512-token prompt 32 tok/s against ~390 (token by token).
