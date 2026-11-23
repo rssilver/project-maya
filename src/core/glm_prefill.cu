@@ -18,6 +18,7 @@
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
 #include "glm_fast_state.hpp"
 #include "glm_ablate.cuh"
+#include "glm_lora.cuh"
 
 #include "strata/core/exl3_mma_rows.hpp"
 #include "strata/core/prefill_chunks.hpp"
@@ -1048,6 +1049,10 @@ static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 bool Glm5Model::prefill_setup(std::string& err) {
     (void) err;
     if (getenv("STRATA_GLM_NO_PREFILL") != nullptr) return true;
+    if (glm_lora::on()) {   // STRATA_GLM_LORA: only the one-token decode applies the adapter
+        std::fprintf(stderr, "glm prefill: a LoRA adapter is on (STRATA_GLM_LORA) - the prompt runs token by token\n");
+        return true;
+    }
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
         return true;
